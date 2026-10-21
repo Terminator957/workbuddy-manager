@@ -38,7 +38,8 @@ def _oai_error(message: str, status: int = 400, err_type: str = 'invalid_request
     err: dict = {'message': message, 'type': err_type, 'code': code}
     if hint:
         err['gateway_hint'] = hint
-    return JSONResponse({'error': err}, status_code=status)
+    headers = {'X-Credential-Failure': '1'} if status == 401 and code == 'invalid_api_key' else None
+    return JSONResponse({'error': err}, status_code=status, headers=headers)
 
 
 def _bearer(request: Request) -> str:

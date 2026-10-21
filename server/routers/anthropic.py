@@ -71,7 +71,8 @@ def _err(message: str, status: int = 400, err_type: str = 'invalid_request_error
     err: dict = {'type': err_type, 'message': message}
     if hint:
         err['gateway_hint'] = hint
-    return JSONResponse({'type': 'error', 'error': err}, status_code=status)
+    headers = {'X-Credential-Failure': '1'} if status == 401 and message == 'API Key 无效' else None
+    return JSONResponse({'type': 'error', 'error': err}, status_code=status, headers=headers)
 
 
 def _as_int(value: object) -> int:
