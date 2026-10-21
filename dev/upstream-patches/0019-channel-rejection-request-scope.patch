@@ -1,0 +1,391 @@
+diff --git a/internal/server/channel_check_test.go b/internal/server/channel_check_test.go
+index d81a9fc..0bcf4f7 100644
+--- a/internal/server/channel_check_test.go
++++ b/internal/server/channel_check_test.go
+@@ -12,12 +12,7 @@ import (
+ 	"workbuddy2api/internal/upstream"
+ )
+ 
+-// 渠道校验的处置：**换路径兜底 + 绝不禁用**（2026-10-17 用户报告）。
+-//
+-// 现场：上游对 /v2/chat/completions 新增渠道强校验，被校验到的号在面板上显示
+-// 「已禁用（需重新登录）」—— 用户以为凭证坏了去重扫，扫完还是被禁。实际是凭封套里
+-// 那句历史遗留的 `request illegal` 落进了「账号被封 → 硬禁用」，而账号本身是好的。
+-// 官方客户端走的 /console 端点并未加强校验（报告方实测：换过去就通了）。
++// 渠道拒绝终止当前请求，不换路径、不冷却账号。
+ 
+ // channelCheckBody 一次渠道校验的封套。业务码拼接构造，避免手抄整串出错。
+ func channelCheckBody() string {
+@@ -39,7 +34,7 @@ func sseResponse(status int, body string) *http.Response {
+ 	}
+ }
+ 
+-func TestChatFallsBackToConsoleOnChannelCheck(t *testing.T) {
++func TestChatPreservesChannelRejection(t *testing.T) {
+ 	var paths []string
+ 	up := &upstream.Client{
+ 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+@@ -58,29 +53,19 @@ func TestChatFallsBackToConsoleOnChannelCheck(t *testing.T) {
+ 	rec := httptest.NewRecorder()
+ 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+ 		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+-	if rec.Code != 200 {
+-		t.Fatalf("应经 /console 兜底成功，got code=%d body=%s", rec.Code, rec.Body.String())
+-	}
+-	var sawV2, sawConsole bool
+-	for _, p := range paths {
+-		sawV2 = sawV2 || strings.Contains(p, "/v2/chat/completions")
+-		sawConsole = sawConsole || strings.Contains(p, "/console/chat/completions")
++	if rec.Code != 400 || !strings.Contains(rec.Body.String(), "channel_rejected") {
++		t.Fatalf("want original channel rejection: %d %s", rec.Code, rec.Body.String())
+ 	}
+-	if !sawV2 || !sawConsole {
+-		t.Fatalf("应先在 /v2 被拒再换 /console，实际路径=%v", paths)
++	if len(paths) != 1 || paths[0] != "/v2/chat/completions" {
++		t.Fatalf("must not try another endpoint: %v", paths)
+ 	}
+ 	st, _ := p.Status("u1")
+-	if st.Disabled {
+-		t.Error("换路径已经成功，账号不该被禁用")
+-	}
+-	if st.Cooling {
+-		t.Error("换路径已经成功，账号不该被冷却")
++	if st.Disabled || st.Cooling || st.ConsecutiveFails != 0 || len(st.RateLimitedModels) != 0 {
++		t.Fatalf("account state changed: %+v", st)
+ 	}
+ }
+ 
+ func TestChatChannelCheckNeverDisables(t *testing.T) {
+-	// 两条路径都被渠道校验拒：软冷却（退出轮换、别被反复选中），但**不禁用** ——
+-	// 禁用会写「需重新登录」，把用户指向错误的排查方向（凭证是好的）。
+ 	up := &upstream.Client{
+ 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+ 			return sseResponse(400, channelCheckBody()), nil
+@@ -98,11 +83,8 @@ func TestChatChannelCheckNeverDisables(t *testing.T) {
+ 	if st.Disabled {
+ 		t.Fatalf("渠道校验**绝不能**禁用账号（用户报告的症状）：reason=%q", st.DisabledReason)
+ 	}
+-	if !st.Cooling || st.CoolKind != "soft_rate" {
+-		t.Fatalf("两条路径都被拒时应软冷却让它退出轮换：%+v", st)
+-	}
+-	if !strings.Contains(st.Reason, "channel check") {
+-		t.Errorf("冷却原因应写明是渠道校验，便于排障：%q", st.Reason)
++	if st.Cooling || st.ConsecutiveFails != 0 || len(st.RateLimitedModels) != 0 {
++		t.Fatalf("channel rejection must not penalize account: %+v", st)
+ 	}
+ }
+ 
+diff --git a/internal/server/channel_rejected_test.go b/internal/server/channel_rejected_test.go
+new file mode 100644
+index 0000000..0163dbc
+--- /dev/null
++++ b/internal/server/channel_rejected_test.go
+@@ -0,0 +1,57 @@
++package server
++
++import (
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"workbuddy2api/internal/auth"
++	"workbuddy2api/internal/upstream"
++)
++
++var channelRejectedBody = `{"code":11128,"msg":"Illegal API invocation from an unapproved channel","requestId":"channel-test"}`
++
++func TestChannelRejectedDoesNotRotateOrFallback(t *testing.T) {
++	calls := 0
++	up := &upstream.Client{
++		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
++			calls++
++			return &http.Response{
++				StatusCode: 400,
++				Header:     http.Header{"Content-Type": []string{"application/json"}},
++				Body:       io.NopCloser(strings.NewReader(channelRejectedBody)),
++			}, nil
++		})},
++		ChatBaseCN:    "https://fake.example",
++		BillingBaseCN: "https://fake.example",
++	}
++	p := testPoolWith(
++		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
++		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
++	)
++	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: 600 * time.Second})
++
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
++		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
++
++	if rec.Code != http.StatusBadRequest {
++		t.Fatalf("应回 400（渠道拒绝），got %d body=%s", rec.Code, rec.Body.String())
++	}
++	if calls != 1 {
++		t.Errorf("不该轮转（同一 body 换号结果不变，白扔配额）：上游被调用了 %d 次", calls)
++	}
++	if !strings.Contains(rec.Body.String(), "11128") {
++		t.Errorf("应透传上游原文（含 code，客户端按它自查）：%s", rec.Body.String())
++	}
++	// 不罚号：两个号都不该被冷却/禁用
++	for _, uid := range []string{"u1", "u2"} {
++		st, _ := p.Status(uid)
++		if st.Cooling || st.Disabled || st.ConsecutiveFails != 0 || len(st.RateLimitedModels) != 0 {
++			t.Errorf("%s 不该被罚（这是请求的问题）：%+v", uid, st)
++		}
++	}
++}
+diff --git a/internal/server/handler.go b/internal/server/handler.go
+index 9e9c871..f0e0ef7 100644
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -819,6 +819,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 			// 不喂连败），fail 只释放租约。error-passthrough：message 装上游 body 原文
+ 			// （code/msg/requestId 原样，含真实 token 数与上限值——上游原文是最有价值
+ 			// 的错误信息，客户端必须看到，禁止固定词覆盖）。
++			if kind == upstream.ErrChannelRejected {
++				fail(acct.UID)
++				writeOpenAIErrorHint(w, status, "channel_rejected", string(respBody),
++					"upstream rejected this request channel; no account cooldown applied")
++				st.status = status
++				return
++			}
+ 			if kind == upstream.ErrPromptTooLong {
+ 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+ 				fail(acct.UID)
+@@ -1073,8 +1080,6 @@ func rotateBackoff(i int, ctx context.Context) bool {
+ //     达到 breakerThreshold 触发熔断（指数退避）。
+ //   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11102 负缓存避让（复用 modelCooldowns
+ //     机制，Until=指数退避 TTL，选号侧 healthyForModel 避开，切模型即可用）。
+-//   - ErrFallbackModelMissing → 回退路径上的 11102（issue #245）：零动作（不冷却/不熔断/
+-//     不 NoteError），仍然轮转 —— 失败的是路径不是账号，写成模型级冷却会把整池打穿。
+ //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断；ErrClient
+ //     额外喂连败计数（NoteFailures，issue #114）：未知 4xx 连败 N 次临时出池——
+ //     「不知道原因的兜底」，与冷却「知道原因的惩罚」并存取更长者不叠加（health
+@@ -1204,6 +1209,9 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
+ 		// 内容策略拦截：内容问题非账号问题，不罚账号（无冷却/熔断/NoteError）。
+ 		// passthrough 首遇由 chatCompletions 内降级重试处理；最终仍拦则回 400
+ 		// content_blocked（防火墙文案），不再轮转、不暴露账号/冷却/错误码。
++	case upstream.ErrChannelRejected:
++		// A channel rejection is not evidence that the account or model is unavailable.
++		return
+ 	case upstream.ErrEmptyMessage:
+ 		// 11151 空消息：请求的问题（同 body 换号结果不变），零动作 —— 不冷却/不熔断/
+ 		// 不 NoteError，由 chatCompletions 的 fail-fast 分支直接 400 透传（issue #203）。
+diff --git a/internal/upstream/channel_check_test.go b/internal/upstream/channel_check_test.go
+index 43fb550..b4f5cc1 100644
+--- a/internal/upstream/channel_check_test.go
++++ b/internal/upstream/channel_check_test.go
+@@ -60,17 +60,17 @@ func TestIsChannelCheckDoesNotSwallowContentBlock(t *testing.T) {
+ }
+ 
+ func TestClassifyRoutesChannelCheckToAccountFault(t *testing.T) {
+-	// 归账号级是为了让 handler 的 ErrAccountFault 分支接管（那里最先判它、只软冷却）。
++	// 渠道拒绝独立分类，由 handler 直接返回，不改变账号状态。
+ 	// 落通用 4xx 的后果是「只换号不罚」：坏号留在池里、每次被选中都失败。
+-	if got := Classify(400, channelBody); got != ErrAccountFault {
+-		t.Errorf("渠道校验应归 ErrAccountFault（供 handler 软冷却），got %v", got)
++	if got := Classify(400, channelBody); got != ErrChannelRejected {
++		t.Errorf("渠道校验应归 ErrChannelRejected（供 handler 软冷却），got %v", got)
+ 	}
+ }
+ 
+-func TestChatPathsHaveConsoleFallback(t *testing.T) {
++func TestChatPathsDoNotFallback(t *testing.T) {
+ 	c := &Client{}
+ 	paths := c.chatPaths(nil)
+-	if len(paths) != 2 || paths[0] != "/v2/chat/completions" || paths[1] != "/console/chat/completions" {
+-		t.Fatalf("路径候选应为 [/v2, /console]（/v2 优先，兜底 /console），got %v", paths)
++	if len(paths) != 1 || paths[0] != "/v2/chat/completions" {
++		t.Fatalf("unexpected chat paths: %v", paths)
+ 	}
+ }
+diff --git a/internal/upstream/client.go b/internal/upstream/client.go
+index f4aa73b..1a4aca2 100644
+--- a/internal/upstream/client.go
++++ b/internal/upstream/client.go
+@@ -42,15 +42,16 @@ const (
+ 	// ErrEmptyMessage 11151「a message has empty content」→ 请求级错误：同 body 换
+ 	// 任何账号都是同一结果，换号只会白扔健康号配额、最后把 400 包装成 503（issue #203）。
+ 	ErrEmptyMessage
+-	// ErrFallbackModelMissing 回退路径（/console）报的 11102（issue #245）→ 请求级
+-	// 错误：它只说明「这条路径没有这个模型」，不构成「该账号缺这个模型」的证据。
+-	// 不能落 ErrModelBlocked —— handler 会写 6 小时 (账号,模型) 负缓存，十几个号轮
+-	// 一圈就是整池 503；也不该按 ErrClient 喂连败计数（失败的是路径不是账号）。
+-	ErrFallbackModelMissing
++	ErrFallbackModelMissing // 保留既有错误分类值。
++	ErrChannelRejected      // 渠道拒绝只终止当前请求，不改变账号状态。
+ )
+ 
+ func (k ErrKind) String() string {
+ 	switch k {
++	case ErrFallbackModelMissing:
++		return "fallback_model_missing"
++	case ErrChannelRejected:
++		return "channel_rejected"
+ 	case ErrHardCredit:
+ 		return "hard_credit"
+ 	case ErrSoftRate:
+@@ -79,8 +80,6 @@ func (k ErrKind) String() string {
+ 		return "empty_message"
+ 	case ErrToolCallMismatch:
+ 		return "tool_call_mismatch"
+-	case ErrFallbackModelMissing:
+-		return "fallback_model_missing"
+ 	case ErrClient:
+ 		return "client"
+ 	default:
+@@ -609,12 +608,8 @@ func Classify(status int, body string) ErrKind {
+ 	if sessionDeadRule.hit(body, lower) {
+ 		return ErrSessionDead
+ 	}
+-	// 渠道校验（/v2 上的新强校验，2026-10-17）：归**账号级**分类，但 applyErrorPolicy
+-	// 里最先判它、只做软冷却（绝不禁用，理由见那里的注释）。不在这里归类的话：没带
+-	// `request illegal` 字样的渠道校验会落通用 4xx「只换号不罚号」，坏号留在池里
+-	// "显示健康、每次被选中都失败" —— 与 issue #201 缺陷 2 同型。
+ 	if IsChannelCheck(body) {
+-		return ErrAccountFault
++		return ErrChannelRejected
+ 	}
+ 	if accountFaultRule.hit(body, lower) {
+ 		return ErrAccountFault
+@@ -1162,6 +1157,7 @@ func IsChannelCheck(body string) bool {
+ 	}
+ 	return strings.Contains(body, "渠道校验") ||
+ 		strings.Contains(lower, "channel verification") ||
++		strings.Contains(lower, "unapproved channel") ||
+ 		strings.Contains(lower, "official client")
+ }
+ 
+@@ -1212,7 +1208,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
+ 		return nil, 0, nil, cerr
+ 	}
+ 	paths := c.chatPaths(a)
+-	for i, path := range paths {
++	for _, path := range paths {
+ 		url := c.chatBase(a) + path
+ 		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(prepared))
+ 		if err != nil {
+@@ -1246,31 +1242,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
+ 			kind := Classify(resp.StatusCode, string(raw))
+ 			log.Printf("WARN: [upstream] chat_stream acct=%s: upstream %d %s body=%s",
+ 				logfmt.Label(a.UID, a.Nickname), resp.StatusCode, kind, truncate(string(raw), 200))
+-			// 回退路径上的 11102 降级（issue #245）：能走到 /console 是因为 /v2 判了渠道
+-			// 校验，而 /console 本来就可能不提供这个模型 —— 11102 只说明「这条路径没有」，
+-			// 不是「该账号缺这个模型」。照 ErrModelBlocked 处理，handler 会写 (账号,模型)
+-			// 6 小时负缓存，逐个账号轮过去就是整池 503 no_healthy_account，比不换路径更糟。
+-			// 也不按 ErrClient 处理：连败计数是账号健康信号，这里失败的是路径不是账号。
+-			if i > 0 && kind == ErrModelBlocked {
+-				log.Printf("WARN: [upstream] chat_stream acct=%s: 回退路径 %s 报 %s，按请求级处理（不写模型冷却）",
+-					logfmt.Label(a.UID, a.Nickname), path, kind)
+-				kind = ErrFallbackModelMissing
+-			}
+-			// 路径级拒绝 → 换下一个候选路径再试，**不**把它当账号问题。
+-			//   · 渠道校验（11128/11-128）：/v2 新增强校验，/console 放行（见 chatPaths）；
+-			// 触发条件**只有渠道校验**：404/405 不回落是 #119 的刻意取舍（/console 挂
+-			// WAF 内容规则，不能因为路径写错就整批改道），契约由
+-			// TestGlobalChatNoFallbackOn404 钉着；渠道校验是另一回事 —— /v2 新加强
+-			// 校验而 /console 放行，不换就是整池被拦。只在还有候选时继续；两条都
+-			// 失败仍按下面原有逻辑返回，由 handler 决定怎么罚号 —— 那时也**不该禁用**
+-			// （见 handler 的 ErrAccountFault 分支）。
+-			if i < len(paths)-1 && IsChannelCheck(string(raw)) {
+-				log.Printf("WARN: [upstream] chat_stream acct=%s: %s 被拒（%d），换路径 %s 重试",
+-					logfmt.Label(a.UID, a.Nickname), path, resp.StatusCode, paths[i+1])
+-				continue
+-			}
+-			// ≥400 直接返回（除上面的渠道校验换路径外，chat 层无 fallback 链；billing
+-			// 层的 404 fallback 独立存在，语义不受影响）。
++			// 保留原始拒绝；换路径会把渠道拒绝覆盖成模型不存在。
+ 			// 分类一次、随 Kind 信封返回（含 Retry-After 头解析，P1-2）：
+ 			// ErrNone 是防御分支（≥400 不应产生 None），返回原文让 handler 兜底。
+ 			if kind == ErrNone {
+@@ -1290,18 +1262,9 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
+ 	panic("unreachable: chatPaths is never empty") // for range 空集时编译器仍要求兜底 return；chatPaths 恒非空（构造保证），永不触达
+ }
+ 
+-// chatPaths 返回按 realm 的 chat 路径候选序列：**/v2 优先，/console 兜底**。
+-//
+-// 兜底是 2026-10-17 加的（用户报告 + 实测）：上游对 /v2/chat/completions 新增了渠道
+-// 强校验 —— 被校验到的请求回 11128 / 11-128「没通过渠道校验，可能不是官方客户端发出的」，
+-// 而官方客户端走的 /console 端点正常放行；换过去之后连通性测试与对话全部恢复。
+-//
+-// 与 #119 的关系：那时实测 /console 挂腾讯云 WAF 的 body 内容规则（反引号 printf/whoami
+-// 等命令执行特征确定性 403），所以把 /v2 定为主路径 —— 这一点没变：**只有** /v2 被判定为
+-// 渠道校验时才换 /console（见 ChatStreamContext 的 fallback 条件），主路径行为零改动。
+-// 这也正是 #119 注释里写的「若上游未来关闭 /v2，届时应重新启用 /console」。
++// chatPaths 使用主接口；渠道拒绝直接返回，避免备用接口覆盖原始错误。
+ func (c *Client) chatPaths(a *auth.Auth) []string {
+-	return []string{chatCompletionsPath, chatConsolePath}
++	return []string{chatCompletionsPath}
+ }
+ 
+ // ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens + 上游模型对象全字段）。
+diff --git a/internal/upstream/client_test.go b/internal/upstream/client_test.go
+index 7681b73..11c02a6 100644
+--- a/internal/upstream/client_test.go
++++ b/internal/upstream/client_test.go
+@@ -148,7 +148,7 @@ func TestIsWafBlocked(t *testing.T) {
+ 	}{
+ 		{403, "", true},
+ 		{403, "<html>blocked</html>", true},
+-		{403, `{"code":1}`, false},               // 有 "code": 字段
++		{403, `{"code":1}`, false},                // 有 "code": 字段
+ 		{403, `{"msg":"request illegal"}`, false}, // 有 "msg": 字段（且该文案本就该走 accountFault）
+ 		{402, "", false},                          // 非 403
+ 		{429, "", false},
+@@ -277,7 +277,6 @@ func TestClassifyContentBlocked(t *testing.T) {
+ 		`{"code":11128,"msg":"blocked by security policy"}`,
+ 		`{"code":"11128","msg":"blocked by security policy"}`,
+ 		`Illegal API invocation from an unapproved channel`,
+-		`{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`,
+ 	} {
+ 		if got := Classify(400, body); got != ErrContentBlocked {
+ 			t.Errorf("Classify(400, %q)=%v want ErrContentBlocked", body, got)
+diff --git a/internal/upstream/fallback_model_missing_test.go b/internal/upstream/fallback_model_missing_test.go
+index c170a35..eb4a967 100644
+--- a/internal/upstream/fallback_model_missing_test.go
++++ b/internal/upstream/fallback_model_missing_test.go
+@@ -9,15 +9,8 @@ import (
+ 	"workbuddy2api/internal/auth"
+ )
+ 
+-// issue #245：/v2 判渠道校验、回退 /console 之后拿到的 11102 不能升级成 model_blocked。
+-//
+-// 现场：15 个号跑几小时后全部软冷却、所有请求 503，日志里 11-128 与 11102 混在一起。
+-// 11102 走 BlockModelBackoff（TTL 6 小时起），于是「换接口重试」这一步的净效果变成
+-// 「把账号锁 6 小时」——几个号轮转过去，整池就红了。
+-//
+-// 回退路径上的 11102 只说明「这条路径没有这个模型」：我们是因为 /v2 判了渠道校验才
+-// 换过去的，/console 本来就可能不提供这个模型，这不构成「该账号缺这个模型」的证据。
+-func TestConsoleFallbackModelMissingIsRequestLevel(t *testing.T) {
++// 渠道拒绝保留主接口原文，不尝试可能返回 11102 的备用接口。
++func TestChannelRejectionPreservesPrimaryError(t *testing.T) {
+ 	var paths []string
+ 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		paths = append(paths, r.URL.Path)
+@@ -39,15 +32,18 @@ func TestConsoleFallbackModelMissingIsRequestLevel(t *testing.T) {
+ 	if status != http.StatusBadRequest {
+ 		t.Fatalf("status=%d body=%s", status, raw)
+ 	}
++	if string(raw) != channelBody {
++		t.Fatalf("original error lost: %s", raw)
++	}
+ 	ue, ok := err.(*Error)
+ 	if !ok {
+ 		t.Fatalf("应返回分类信封，got %T (%v)", err, err)
+ 	}
+-	if ue.Kind != ErrFallbackModelMissing {
+-		t.Fatalf("回退路径的 11102 应归请求级（ErrFallbackModelMissing），got %v", ue.Kind)
++	if ue.Kind != ErrChannelRejected {
++		t.Fatalf("渠道拒绝应归 ErrChannelRejected，got %v", ue.Kind)
+ 	}
+-	if len(paths) != 2 || !strings.Contains(paths[0], "/v2/") || !strings.Contains(paths[1], "/console/") {
+-		t.Fatalf("应当先在 /v2 被拒再换 /console，实际路径=%v", paths)
++	if len(paths) != 1 || !strings.Contains(paths[0], "/v2/") {
++		t.Fatalf("应当只请求 /v2，实际路径=%v", paths)
+ 	}
+ }
+ 
