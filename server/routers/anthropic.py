@@ -339,7 +339,7 @@ def to_openai_request(body: dict) -> dict:
     而 OpenAI 要求它是**独立的 `role: tool` 消息**。因此一条 Anthropic 消息
     可能被拆成多条 OpenAI 消息（工具结果在前，剩余文本在后）。
     """
-    out: dict = {'model': body.get('model'), 'stream': bool(body.get('stream'))}
+    out: dict = {'model': body.get('model'), 'stream': bool(body.get('stream')), 'store': False}
 
     messages: list[dict] = []
 

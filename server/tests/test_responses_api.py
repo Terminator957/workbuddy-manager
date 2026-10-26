@@ -573,7 +573,7 @@ class RequestConversionTest(unittest.TestCase):
         self.assertEqual(out['tools'][0]['function']['name'], 'get')
 
     def test_openai_only_fields_not_passed_upstream(self) -> None:
-        """store/include/reasoning 是 OpenAI 专有，上游不认识，丢掉。
+        """store 按服务端策略强制关闭，其余 OpenAI 专有字段不透传。
 
         `stream` **不在此列**：它必须转告上游（上游据此决定回 SSE 还是 JSON）。
         这条断言是 E2E 试出来的——早先把 stream 一并"过滤"掉，流式请求会静默
@@ -587,7 +587,8 @@ class RequestConversionTest(unittest.TestCase):
             'prompt_cache_retention': '24h',
             'reasoning': {'effort': 'high'},
         })
-        for leaked in ('store', 'include', 'prompt_cache_retention', 'reasoning'):
+        self.assertIs(out['store'], False)
+        for leaked in ('include', 'prompt_cache_retention', 'reasoning'):
             self.assertNotIn(leaked, out, f'{leaked} 不该透给上游')
 
     def test_prompt_cache_key_forwarded(self) -> None:

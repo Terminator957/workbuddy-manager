@@ -1057,6 +1057,9 @@ async def _chat(request: Request, upstream_path: str):
     if mapped:
         body['model'] = mapped
 
+    # 服务端隐私策略：客户端不能开启上游会话保存。
+    body['store'] = False
+
     # 越界的 max_tokens 会被上游包装成 503（见 clamp_max_tokens 的说明），
     # 鉴权后、转发前压回上限。
     clamp_max_tokens(body)

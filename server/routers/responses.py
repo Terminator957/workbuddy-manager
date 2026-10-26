@@ -508,7 +508,7 @@ def to_chat_request(body: dict, custom_tool_names: set[str] | None = None,
     # 漏掉它会得到一个"看起来很成功"的结果——网关按流式解析，上游却回了 JSON，
     # 于是一个 data 帧都解析不出来，客户端只收到 response.created + completed 的
     # 空回答（不报错、不重试）。本项含在 E2E 里专门守着。
-    out: dict = {'model': body.get('model'), 'stream': bool(body.get('stream'))}
+    out: dict = {'model': body.get('model'), 'stream': bool(body.get('stream')), 'store': False}
 
     messages: list[dict] = []
 
@@ -831,7 +831,7 @@ def to_chat_request(body: dict, custom_tool_names: set[str] | None = None,
     if isinstance(body.get('prompt_cache_key'), str) and body['prompt_cache_key']:
         out['prompt_cache_key'] = body['prompt_cache_key']
 
-    # 只透传**上游认识**的字段。`store` / `include` 这些 OpenAI 专有、上游不消费；
+    # 只透传**上游认识**的字段。`store` 已在上面按服务端隐私策略强制关闭；`include` 不透传；
     # `reasoning` 也不整个透传——上游不认识这个对象，它的档位已按上面转成
     # `reasoning_effort`。
     # （`stream` 不在其列——它必须转告上游，见函数开头。）
