@@ -42,6 +42,7 @@ import type {
   PgSyncStatus,
   PgSyncTestResult,
   PlaygroundModels,
+  ProbeModelsResponse,
   RedPacket,
   RedPacketDetail,
   RedPacketKind,
@@ -165,6 +166,10 @@ const groupQs = (upstreamId?: number | null): string =>
 
 export const accountApi = {
   proxies: () => get<{routes: string[]; default: string}>('/api/proxies'),
+  /** 上游「账号管理接口」（admin.enabled）开关状态；供解禁队列判断能否真的解封。
+   *  非默认分组返回 null（面板读不到那套实例的 config.json）。 */
+  adminApiStatus: (upstreamId?: number | null) =>
+    get<{enabled: boolean | null}>('/api/accounts/admin-api-status' + groupQs(upstreamId)),
   setProxy: (filename: string, proxy: string, upstreamId?: number | null) =>
     put<{ok: boolean; proxy: string; reload_triggered: boolean}>(
       `/api/accounts/${encodeURIComponent(filename)}/proxy` + groupQs(upstreamId), {proxy}),
@@ -314,6 +319,10 @@ export const accountApi = {
   refresh: (file: string, upstreamId?: number | null) =>
     post<{ok: boolean; message: string}>(
       `/api/accounts/${encodeURIComponent(file)}/refresh${groupQs(upstreamId)}`),
+  /** 账号 × 模型主动探测（issue #270）：files 为账号文件名，models 为模型 id。 */
+  probeModels: (files: string[], models: string[], upstreamId?: number | null) =>
+    post<ProbeModelsResponse>(`/api/accounts/probe-models${groupQs(upstreamId)}`,
+                              {accounts: files, models}),
   /** 一键刷新所有账号的 accessToken（真实续期，末尾只重载一次上游） */
   refreshAllTokens: (upstreamId?: number | null) =>
     post<{
@@ -372,8 +381,11 @@ export const accountApi = {
    * 调用上游自带的 scripts/task_runner.py。full（点亮）会伪造活跃上报，
    * 因此单独要求 confirm，与幂等的 claim 区分开。 */
   taskRunStatus: () => get<TaskRunStatus>('/api/task-run'),
-  taskRunStart: (mode: 'preview' | 'claim' | 'full', target = 'ALL', confirm = false) =>
-    post<{ok: boolean; message: string}>('/api/task-run', {mode, target, confirm}),
+  /** upstreamId 选分组（issue #274）：null/省略 = 默认分组的账号目录。 */
+  taskRunStart: (mode: 'preview' | 'claim' | 'full', target = 'ALL', confirm = false,
+                 upstreamId: number | null = null) =>
+    post<{ok: boolean; message: string}>('/api/task-run',
+      {mode, target, confirm, upstream_id: upstreamId}),
   taskRunStop: () => post<{ok: boolean; message: string}>('/api/task-run/stop'),
 
   /* ── 定时领奖配置：**后端有、前端有意不做 UI** ───────────────

@@ -622,6 +622,23 @@ export interface RequestLog {
   ip: string;
   model: string | null;
   mapped_model: string | null;
+  /**
+   * 思考强度（reasoning_effort）：客户端在请求体里**显式传的**档位
+   * （low / medium / high / max…，不同模型档位不同）。
+   *
+   * null = 客户端没传（走模型默认档）或该字段上线前的历史记录——界面显示「—」。
+   * 刻意不做推断：把「默认」写成某个具体档位，排查时会误判客户端行为
+   * （例如以为客户端一直在要 max）。
+   */
+  effort: string | null;
+  /**
+   * 客户端渠道（issue #233）：按 User-Agent 归类（codex / vscode / cli / wb /
+   * web / api / other / unknown）。
+   *
+   * 只用于排查「哪类客户端在把账号打进 429」，**不改变网关行为**。
+   * null = 该列上线前的历史记录（界面显示「—」）。
+   */
+  channel: string | null;
   status: number;
   prompt_tokens: number;
   completion_tokens: number;
@@ -710,6 +727,20 @@ export interface CreditsFlowPoint {
 }
 
 /**
+ * 单日按小时桶（`days=1` 时后端额外返回，粒度规则与用量趋势图一致）。
+ *
+ * 固定 24 个桶补零：X 轴长度不随「今天走到几点」变化，图上不会因为还没到的
+ * 时段而抖动。
+ */
+export interface CreditsFlowHourPoint {
+  day: string;
+  hour: number;
+  income: number;
+  expense: number;
+  net: number;
+}
+
+/**
  * 积分收支统计。
  *
  * 收入与支出是**两套口径**（见后端 `credits_flow` 的说明）：收入是「余额比
@@ -724,6 +755,10 @@ export interface CreditsFlow {
   week: {income: number; expense: number; net: number};
   total: {income: number; expense: number; net: number};
   daily: CreditsFlowPoint[];
+  /** 范围只有一天时为 hour（此时带 hourly），否则 day。旧后端不返回。 */
+  granularity?: 'day' | 'hour';
+  /** 24 个小时桶；仅 granularity === 'hour' 时存在。 */
+  hourly?: CreditsFlowHourPoint[];
 }
 
 export interface UsageBreakdown {
@@ -966,6 +1001,8 @@ export interface TaskRunStatus {
   running: boolean;
   mode: string;
   target: string;
+  /** 执行的分组名（issue #274）；空串 = 默认分组 */
+  group?: string;
   started_at: number;
   finished_at: number;
   exit_code: number | null;
@@ -986,6 +1023,27 @@ export interface TaskRunStatus {
   schedule: {enabled?: boolean; hours?: number[]};
 }
 
+
+/** 账号 × 模型探测的单条结果（issue #270） */
+export type ProbeStatus = 'ok' | 'rate' | 'credit' | 'auth' | 'no_model' | 'error';
+
+export interface ProbeModelResult {
+  file: string;
+  uid: string;
+  nickname: string;
+  realm: string;
+  model: string;
+  status: ProbeStatus;
+  code: string | null;
+  message: string;
+  latency_ms: number;
+}
+
+export interface ProbeModelsResponse {
+  results: ProbeModelResult[];
+  summary: Record<ProbeStatus, number>;
+  requests: number;
+}
 
 /** 签到记录分页返回 */
 export interface CheckinLogPage {

@@ -139,7 +139,7 @@ index 0000000..0163dbc
 +	}
 +}
 diff --git a/internal/server/handler.go b/internal/server/handler.go
-index 9e9c871..f0e0ef7 100644
+index c198049..4b4dc7f 100644
 --- a/internal/server/handler.go
 +++ b/internal/server/handler.go
 @@ -819,6 +819,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -156,7 +156,7 @@ index 9e9c871..f0e0ef7 100644
  			if kind == upstream.ErrPromptTooLong {
  				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
  				fail(acct.UID)
-@@ -1073,8 +1080,6 @@ func rotateBackoff(i int, ctx context.Context) bool {
+@@ -1091,8 +1098,6 @@ func rotateBackoff(i int, ctx context.Context) bool {
  //     达到 breakerThreshold 触发熔断（指数退避）。
  //   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11102 负缓存避让（复用 modelCooldowns
  //     机制，Until=指数退避 TTL，选号侧 healthyForModel 避开，切模型即可用）。
@@ -165,7 +165,7 @@ index 9e9c871..f0e0ef7 100644
  //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断；ErrClient
  //     额外喂连败计数（NoteFailures，issue #114）：未知 4xx 连败 N 次临时出池——
  //     「不知道原因的兜底」，与冷却「知道原因的惩罚」并存取更长者不叠加（health
-@@ -1204,6 +1209,9 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
+@@ -1228,6 +1233,9 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
  		// 内容策略拦截：内容问题非账号问题，不罚账号（无冷却/熔断/NoteError）。
  		// passthrough 首遇由 chatCompletions 内降级重试处理；最终仍拦则回 400
  		// content_blocked（防火墙文案），不再轮转、不暴露账号/冷却/错误码。
@@ -176,20 +176,23 @@ index 9e9c871..f0e0ef7 100644
  		// 11151 空消息：请求的问题（同 body 换号结果不变），零动作 —— 不冷却/不熔断/
  		// 不 NoteError，由 chatCompletions 的 fail-fast 分支直接 400 透传（issue #203）。
 diff --git a/internal/upstream/channel_check_test.go b/internal/upstream/channel_check_test.go
-index 43fb550..b4f5cc1 100644
+index 43fb550..abd71c6 100644
 --- a/internal/upstream/channel_check_test.go
 +++ b/internal/upstream/channel_check_test.go
-@@ -60,17 +60,17 @@ func TestIsChannelCheckDoesNotSwallowContentBlock(t *testing.T) {
+@@ -59,18 +59,18 @@ func TestIsChannelCheckDoesNotSwallowContentBlock(t *testing.T) {
+ 	}
  }
  
- func TestClassifyRoutesChannelCheckToAccountFault(t *testing.T) {
+-func TestClassifyRoutesChannelCheckToAccountFault(t *testing.T) {
 -	// 归账号级是为了让 handler 的 ErrAccountFault 分支接管（那里最先判它、只软冷却）。
-+	// 渠道拒绝独立分类，由 handler 直接返回，不改变账号状态。
- 	// 落通用 4xx 的后果是「只换号不罚」：坏号留在池里、每次被选中都失败。
+-	// 落通用 4xx 的后果是「只换号不罚」：坏号留在池里、每次被选中都失败。
 -	if got := Classify(400, channelBody); got != ErrAccountFault {
 -		t.Errorf("渠道校验应归 ErrAccountFault（供 handler 软冷却），got %v", got)
-+	if got := Classify(400, channelBody); got != ErrChannelRejected {
-+		t.Errorf("渠道校验应归 ErrChannelRejected（供 handler 软冷却），got %v", got)
++func TestClassifyRoutesChannelCheckToRequestError(t *testing.T) {
++	for _, status := range []int{400, 401, 403, 429} {
++		if got := Classify(status, channelBody); got != ErrChannelRejected {
++			t.Errorf("channel check with HTTP %d: got %v, want ErrChannelRejected", status, got)
++		}
  	}
  }
  
@@ -204,55 +207,49 @@ index 43fb550..b4f5cc1 100644
  	}
  }
 diff --git a/internal/upstream/client.go b/internal/upstream/client.go
-index f4aa73b..1a4aca2 100644
+index a54af5b..68d689a 100644
 --- a/internal/upstream/client.go
 +++ b/internal/upstream/client.go
-@@ -42,15 +42,16 @@ const (
- 	// ErrEmptyMessage 11151「a message has empty content」→ 请求级错误：同 body 换
- 	// 任何账号都是同一结果，换号只会白扔健康号配额、最后把 400 包装成 503（issue #203）。
- 	ErrEmptyMessage
--	// ErrFallbackModelMissing 回退路径（/console）报的 11102（issue #245）→ 请求级
--	// 错误：它只说明「这条路径没有这个模型」，不构成「该账号缺这个模型」的证据。
--	// 不能落 ErrModelBlocked —— handler 会写 6 小时 (账号,模型) 负缓存，十几个号轮
--	// 一圈就是整池 503；也不该按 ErrClient 喂连败计数（失败的是路径不是账号）。
--	ErrFallbackModelMissing
-+	ErrFallbackModelMissing // 保留既有错误分类值。
-+	ErrChannelRejected      // 渠道拒绝只终止当前请求，不改变账号状态。
+@@ -57,10 +57,13 @@ const (
+ 	// 一次误判就是永久杀号。故单列一类，由 handler 走「连续 N 次才禁用」的计数
+ 	// 路径（与 12153 的 NoteSessionDead 同口径、共用计数器）。
+ 	ErrAuthRejected
++	ErrChannelRejected // 渠道拒绝只终止当前请求，不改变账号状态。
  )
  
  func (k ErrKind) String() string {
  	switch k {
-+	case ErrFallbackModelMissing:
-+		return "fallback_model_missing"
 +	case ErrChannelRejected:
 +		return "channel_rejected"
  	case ErrHardCredit:
  		return "hard_credit"
  	case ErrSoftRate:
-@@ -79,8 +80,6 @@ func (k ErrKind) String() string {
- 		return "empty_message"
- 	case ErrToolCallMismatch:
- 		return "tool_call_mismatch"
--	case ErrFallbackModelMissing:
--		return "fallback_model_missing"
- 	case ErrClient:
- 		return "client"
- 	default:
-@@ -609,12 +608,8 @@ func Classify(status int, body string) ErrKind {
+@@ -621,6 +624,10 @@ func Classify(status int, body string) ErrKind {
  	if sessionDeadRule.hit(body, lower) {
  		return ErrSessionDead
+ 	}
++	// 业务级渠道拒绝优先于纯 401，避免触发账号失效计数。
++	if IsChannelCheck(body) {
++		return ErrChannelRejected
++	}
+ 	// 401 兜底（**无 12153** 的纯 401）：上游网关拦截页、空体、纯 HTML 都落到
+ 	// 这里。单列 ErrAuthRejected 而不是 ErrClient —— 见该 errkind 的注释：
+ 	// ErrClient 只换号不罚号，坏号会在池里反复被选中；而这一类的正确处置是
+@@ -628,13 +635,6 @@ func Classify(status int, body string) ErrKind {
+ 	if status == http.StatusUnauthorized {
+ 		return ErrAuthRejected
  	}
 -	// 渠道校验（/v2 上的新强校验，2026-10-17）：归**账号级**分类，但 applyErrorPolicy
 -	// 里最先判它、只做软冷却（绝不禁用，理由见那里的注释）。不在这里归类的话：没带
 -	// `request illegal` 字样的渠道校验会落通用 4xx「只换号不罚号」，坏号留在池里
 -	// "显示健康、每次被选中都失败" —— 与 issue #201 缺陷 2 同型。
- 	if IsChannelCheck(body) {
+-	if IsChannelCheck(body) {
 -		return ErrAccountFault
-+		return ErrChannelRejected
- 	}
+-	}
  	if accountFaultRule.hit(body, lower) {
  		return ErrAccountFault
-@@ -1162,6 +1157,7 @@ func IsChannelCheck(body string) bool {
+ 	}
+@@ -1181,6 +1181,7 @@ func IsChannelCheck(body string) bool {
  	}
  	return strings.Contains(body, "渠道校验") ||
  		strings.Contains(lower, "channel verification") ||
@@ -260,7 +257,7 @@ index f4aa73b..1a4aca2 100644
  		strings.Contains(lower, "official client")
  }
  
-@@ -1212,7 +1208,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
+@@ -1231,7 +1232,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
  		return nil, 0, nil, cerr
  	}
  	paths := c.chatPaths(a)
@@ -269,7 +266,7 @@ index f4aa73b..1a4aca2 100644
  		url := c.chatBase(a) + path
  		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(prepared))
  		if err != nil {
-@@ -1246,31 +1242,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
+@@ -1265,31 +1266,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
  			kind := Classify(resp.StatusCode, string(raw))
  			log.Printf("WARN: [upstream] chat_stream acct=%s: upstream %d %s body=%s",
  				logfmt.Label(a.UID, a.Nickname), resp.StatusCode, kind, truncate(string(raw), 200))
@@ -302,7 +299,7 @@ index f4aa73b..1a4aca2 100644
  			// 分类一次、随 Kind 信封返回（含 Retry-After 头解析，P1-2）：
  			// ErrNone 是防御分支（≥400 不应产生 None），返回原文让 handler 兜底。
  			if kind == ErrNone {
-@@ -1290,18 +1262,9 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
+@@ -1309,18 +1286,9 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
  	panic("unreachable: chatPaths is never empty") // for range 空集时编译器仍要求兜底 return；chatPaths 恒非空（构造保证），永不触达
  }
  
@@ -324,19 +321,10 @@ index f4aa73b..1a4aca2 100644
  
  // ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens + 上游模型对象全字段）。
 diff --git a/internal/upstream/client_test.go b/internal/upstream/client_test.go
-index 7681b73..11c02a6 100644
+index ceb1dca..4991919 100644
 --- a/internal/upstream/client_test.go
 +++ b/internal/upstream/client_test.go
-@@ -148,7 +148,7 @@ func TestIsWafBlocked(t *testing.T) {
- 	}{
- 		{403, "", true},
- 		{403, "<html>blocked</html>", true},
--		{403, `{"code":1}`, false},               // 有 "code": 字段
-+		{403, `{"code":1}`, false},                // 有 "code": 字段
- 		{403, `{"msg":"request illegal"}`, false}, // 有 "msg": 字段（且该文案本就该走 accountFault）
- 		{402, "", false},                          // 非 403
- 		{429, "", false},
-@@ -277,7 +277,6 @@ func TestClassifyContentBlocked(t *testing.T) {
+@@ -283,7 +283,6 @@ func TestClassifyContentBlocked(t *testing.T) {
  		`{"code":11128,"msg":"blocked by security policy"}`,
  		`{"code":"11128","msg":"blocked by security policy"}`,
  		`Illegal API invocation from an unapproved channel`,

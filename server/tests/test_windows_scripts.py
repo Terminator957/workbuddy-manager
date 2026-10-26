@@ -291,5 +291,60 @@ class WindowsScriptLayoutTest(unittest.TestCase):
                               f'{cmd} 没有按 %~dp0 调同目录的 {ps1}')
 
 
+class WindowsPythonIsolationTest(unittest.TestCase):
+    """issue #268：预置运行时不能被用户级 site-packages 覆盖。"""
+
+    def test_python_env_disables_user_site(self) -> None:
+        src = (_ROOT / 'windows' / 'python-env.ps1').read_text(encoding='utf-8-sig')
+        self.assertIn("$env:PYTHONNOUSERSITE = '1'", src,
+                      'python-env.ps1 没有禁用用户级 site-packages；'
+                      '用户目录里的旧 typing_extensions 会盖住内置运行时')
+
+    def test_runtime_scripts_source_the_common_env(self) -> None:
+        """启动/准备/更新/服务脚本都必须 dot-source 这个公共设置。"""
+        for name in ('prepare.ps1', 'start.ps1', 'update.ps1', 'service-tools.ps1'):
+            with self.subTest(script=name):
+                src = (_ROOT / 'windows' / name).read_text(encoding='utf-8-sig')
+                self.assertIn('python-env.ps1', src,
+                              f'{name} 没加载 python-env.ps1，无法继承 PYTHONNOUSERSITE')
+
+
+class WindowsAutostartTest(unittest.TestCase):
+    """issue #269：Windows 启动器开机自启（HKCU Run + 静默到托盘 + 卸载清理）。"""
+
+    def _src(self, name: str) -> str:
+        path = _ROOT / 'windows' / 'launcher' / 'src' / name
+        self.assertTrue(path.is_file(), f'缺少 {path}')
+        return path.read_text(encoding='utf-8-sig')
+
+    def test_uses_current_user_run_key(self) -> None:
+        """当前用户 Run 键即可，不需要管理员权限；不能写 HKLM。"""
+        src = self._src('Autostart.cs')
+        self.assertIn(r'Software\Microsoft\Windows\CurrentVersion\Run', src)
+        self.assertIn('Registry.CurrentUser', src)
+        self.assertNotIn('Registry.LocalMachine', src)
+
+    def test_silent_argument_is_tray(self) -> None:
+        self.assertIn('--tray', self._src('Autostart.cs'))
+        self.assertIn('Autostart.SilentArgument', self._src('Program.cs'))
+
+    def test_hidden_start_does_not_show_then_hide(self) -> None:
+        """静默启动必须拦住 SetVisibleCore，不能先 Show 再 Hide（会闪窗口）。"""
+        src = self._src('MainForm.cs')
+        self.assertIn('protected override void SetVisibleCore(bool value)', src)
+        self.assertIn('base.SetVisibleCore(false)', src)
+        self.assertIn('CreateHandle()', src)
+
+    def test_tray_failure_falls_back_to_window(self) -> None:
+        src = self._src('MainForm.cs')
+        self.assertIn('_startHidden = false;', src,
+                      '托盘初始化失败时必须回退为显示窗口（否则既无窗口也无托盘）')
+
+    def test_uninstall_removes_autostart(self) -> None:
+        src = self._src('UninstallForm.cs')
+        self.assertIn('Autostart.DisableIfOwned(_installDir)', src,
+                      '卸载要清理开机自启，否则卸载后仍会自启')
+
+
 if __name__ == '__main__':
     unittest.main()
