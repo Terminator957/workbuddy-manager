@@ -207,10 +207,10 @@ index 43fb550..abd71c6 100644
  	}
  }
 diff --git a/internal/upstream/client.go b/internal/upstream/client.go
-index a54af5b..68d689a 100644
+index 0e5efd6..74d660e 100644
 --- a/internal/upstream/client.go
 +++ b/internal/upstream/client.go
-@@ -57,10 +57,13 @@ const (
+@@ -58,10 +58,13 @@ const (
  	// 一次误判就是永久杀号。故单列一类，由 handler 走「连续 N 次才禁用」的计数
  	// 路径（与 12153 的 NoteSessionDead 同口径、共用计数器）。
  	ErrAuthRejected
@@ -224,7 +224,7 @@ index a54af5b..68d689a 100644
  	case ErrHardCredit:
  		return "hard_credit"
  	case ErrSoftRate:
-@@ -621,6 +624,10 @@ func Classify(status int, body string) ErrKind {
+@@ -622,6 +625,10 @@ func Classify(status int, body string) ErrKind {
  	if sessionDeadRule.hit(body, lower) {
  		return ErrSessionDead
  	}
@@ -235,7 +235,7 @@ index a54af5b..68d689a 100644
  	// 401 兜底（**无 12153** 的纯 401）：上游网关拦截页、空体、纯 HTML 都落到
  	// 这里。单列 ErrAuthRejected 而不是 ErrClient —— 见该 errkind 的注释：
  	// ErrClient 只换号不罚号，坏号会在池里反复被选中；而这一类的正确处置是
-@@ -628,13 +635,6 @@ func Classify(status int, body string) ErrKind {
+@@ -629,13 +636,6 @@ func Classify(status int, body string) ErrKind {
  	if status == http.StatusUnauthorized {
  		return ErrAuthRejected
  	}
@@ -249,7 +249,22 @@ index a54af5b..68d689a 100644
  	if accountFaultRule.hit(body, lower) {
  		return ErrAccountFault
  	}
-@@ -1181,6 +1181,7 @@ func IsChannelCheck(body string) bool {
+@@ -761,14 +761,6 @@ type Client struct {
+ 	// 只压 chat：refresh/checkin/billing 的请求体都在几 KB 量级，压了纯耗 CPU。
+ 	GzipBody bool
+ 
+-	// channelBlocked 记录被渠道校验拦过的账号 → 到期时间（issue #296）。
+-	// 命中后该账号后续请求**优先走 /console**（官方客户端路径），不必每次都先
+-	// 撞一次 /v2 的 11128 再换路径 —— 既省一次往返，也避免同一账号在一轮对话里
+-	// 反复触发风控计数。TTL 后自动回落到 /v2 主路径，防止上游策略变化后永远
+-	// 走次优路径。
+-	channelBlockedMu sync.Mutex
+-	channelBlocked   map[string]time.Time
+-
+ 	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认 WorkBuddy
+ 	// 三段式与 billingUA 单段式）。空 = 默认官方形态：chat/refresh/FetchModels 走
+ 	// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`；billing/checkin 走 `WorkBuddy/<ver>`
+@@ -1196,6 +1188,7 @@ func IsChannelCheck(body string) bool {
  	}
  	return strings.Contains(body, "渠道校验") ||
  		strings.Contains(lower, "channel verification") ||
@@ -257,16 +272,32 @@ index a54af5b..68d689a 100644
  		strings.Contains(lower, "official client")
  }
  
-@@ -1231,7 +1232,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
- 		return nil, 0, nil, cerr
+@@ -1247,14 +1240,10 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
  	}
  	paths := c.chatPaths(a)
--	for i, path := range paths {
-+	for _, path := range paths {
+ 	// 请求体压缩（issue #297）：>64KB 才压；Compressed 为空表示未压缩。
+-	// 这里算一次、循环内复用：路径回落（/v2 → /console）不需要重新压。
++	// 这里算一次；压缩不受支持时在同一路径重发未压缩请求。
+ 	outBody, contentEncoding := c.outboundBody(prepared)
+ 	// gzipRetried 防止「压缩版失败 → 未压缩重试」再次进入同一分支。
+ 	gzipRetried := false
+-	// channelRetried 渠道校验命中且已无备用路径时，允许**原样重发一次**
+-	// （issue #296：上游报文明确写着「请求被拦截，请重新发送」，说明它期望
+-	// 客户端重试；灰度校验有概率性，同一请求重发一次常能通过）。
+-	channelRetried := false
+ 	for i := 0; i < len(paths); i++ {
+ 		path := paths[i]
  		url := c.chatBase(a) + path
- 		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(prepared))
- 		if err != nil {
-@@ -1265,31 +1266,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
+@@ -1295,7 +1284,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
+ 			// 上游不接受压缩请求体（issue #297 兜底）：改成未压缩重发**同一条路径**。
+ 			// 只重试一次，且只对 415 / 「解析失败」类 400 生效 —— 其他 4xx 是请求本身
+ 			// 的问题，重发只是多打一次上游。
+-			if contentEncoding != "" && !gzipRetried &&
++			if contentEncoding != "" && !gzipRetried && !IsChannelCheck(string(raw)) &&
+ 				gzipUnsupported(resp.StatusCode, string(raw)) {
+ 				gzipRetried = true
+ 				contentEncoding = ""
+@@ -1308,47 +1297,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
  			kind := Classify(resp.StatusCode, string(raw))
  			log.Printf("WARN: [upstream] chat_stream acct=%s: upstream %d %s body=%s",
  				logfmt.Label(a.UID, a.Nickname), resp.StatusCode, kind, truncate(string(raw), 200))
@@ -288,21 +319,85 @@ index a54af5b..68d689a 100644
 -			// 校验而 /console 放行，不换就是整池被拦。只在还有候选时继续；两条都
 -			// 失败仍按下面原有逻辑返回，由 handler 决定怎么罚号 —— 那时也**不该禁用**
 -			// （见 handler 的 ErrAccountFault 分支）。
--			if i < len(paths)-1 && IsChannelCheck(string(raw)) {
--				log.Printf("WARN: [upstream] chat_stream acct=%s: %s 被拒（%d），换路径 %s 重试",
--					logfmt.Label(a.UID, a.Nickname), path, resp.StatusCode, paths[i+1])
--				continue
+-			if IsChannelCheck(string(raw)) {
+-				// 记下这个账号被渠道校验拦过：后续请求优先走 /console（issue #296），
+-				// 不必每次都先撞一次 /v2。TTL 到期自动回落，上游策略变化后不会卡在
+-				// 次优路径上。
+-				c.markChannelBlocked(a.UID)
+-				if i < len(paths)-1 {
+-					log.Printf("WARN: [upstream] chat_stream acct=%s: %s 被拒（%d），换路径 %s 重试",
+-						logfmt.Label(a.UID, a.Nickname), path, resp.StatusCode, paths[i+1])
+-					continue
+-				}
+-				// 备用路径也被拦：按上游报文的要求原样重发一次（仅一次）。
+-				// 仍然失败就走下面的错误返回 —— 这条不再重试，避免把 429/风控
+-				// 放大成多倍请求。
+-				if !channelRetried {
+-					channelRetried = true
+-					log.Printf("WARN: [upstream] chat_stream acct=%s: 渠道校验在 %s 上仍被拦，原样重发一次",
+-						logfmt.Label(a.UID, a.Nickname), path)
+-					i--
+-					continue
+-				}
 -			}
 -			// ≥400 直接返回（除上面的渠道校验换路径外，chat 层无 fallback 链；billing
 -			// 层的 404 fallback 独立存在，语义不受影响）。
-+			// 保留原始拒绝；换路径会把渠道拒绝覆盖成模型不存在。
++			// 保留原始拒绝；不换路径、不重发、不修改账号健康状态。
  			// 分类一次、随 Kind 信封返回（含 Retry-After 头解析，P1-2）：
  			// ErrNone 是防御分支（≥400 不应产生 None），返回原文让 handler 兜底。
  			if kind == ErrNone {
-@@ -1309,18 +1286,9 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
- 	panic("unreachable: chatPaths is never empty") // for range 空集时编译器仍要求兜底 return；chatPaths 恒非空（构造保证），永不触达
+@@ -1375,10 +1324,6 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
+ // 只有 ~1Mbps 时首字节要等 20-30 秒 —— 压到 1/4.5 就是实打实的提速。
+ const gzipBodyThreshold = 64 << 10
+ 
+-// channelBlockTTL 渠道校验命中后「优先走 /console」的时长（issue #296）。
+-// 10 分钟覆盖一轮长对话；过短会反复撞 /v2，过长则上游策略变化后迟迟不切回。
+-const channelBlockTTL = 10 * time.Minute
+-
+ // outboundBody 按配置决定 chat 请求体是否压缩，返回最终 body 与 Content-Encoding。
+ // gzip 失败（理论上只有内存不足）时原样返回未压缩 body，不阻断请求。
+ func (c *Client) outboundBody(body []byte) ([]byte, string) {
+@@ -1429,61 +1374,9 @@ func gzipUnsupported(status int, raw string) bool {
+ 	return false
  }
  
+-// markChannelBlocked / channelBlockedFor 维护「该账号被渠道校验拦过」的短期记忆。
+-func (c *Client) markChannelBlocked(uid string) {
+-	if c == nil || uid == "" {
+-		return
+-	}
+-	c.channelBlockedMu.Lock()
+-	if c.channelBlocked == nil {
+-		c.channelBlocked = make(map[string]time.Time)
+-	}
+-	// 顺手清过期项，避免 map 随账号数无限增长（账号数量级很小，够用）。
+-	now := time.Now()
+-	for key, at := range c.channelBlocked {
+-		if now.After(at) {
+-			delete(c.channelBlocked, key)
+-		}
+-	}
+-	c.channelBlocked[uid] = now.Add(channelBlockTTL)
+-	c.channelBlockedMu.Unlock()
+-}
+-
+-func (c *Client) channelBlockedFor(uid string) bool {
+-	if c == nil || uid == "" {
+-		return false
+-	}
+-	c.channelBlockedMu.Lock()
+-	defer c.channelBlockedMu.Unlock()
+-	at, ok := c.channelBlocked[uid]
+-	if !ok {
+-		return false
+-	}
+-	if time.Now().After(at) {
+-		delete(c.channelBlocked, uid)
+-		return false
+-	}
+-	return true
+-}
+-
 -// chatPaths 返回按 realm 的 chat 路径候选序列：**/v2 优先，/console 兜底**。
 -//
 -// 兜底是 2026-10-17 加的（用户报告 + 实测）：上游对 /v2/chat/completions 新增了渠道
@@ -315,6 +410,12 @@ index a54af5b..68d689a 100644
 -// 这也正是 #119 注释里写的「若上游未来关闭 /v2，届时应重新启用 /console」。
 +// chatPaths 使用主接口；渠道拒绝直接返回，避免备用接口覆盖原始错误。
  func (c *Client) chatPaths(a *auth.Auth) []string {
+-	// 被渠道校验拦过的账号：优先走官方客户端路径 /console（issue #296）。
+-	// /v2 仍是主路径（#119 的 /console WAF 取舍不变），这里只调整**顺序**：
+-	// 上一次撞过 11128 的账号，下一轮不必再白跑一次 /v2。
+-	if a != nil && c.channelBlockedFor(a.UID) {
+-		return []string{chatConsolePath, chatCompletionsPath}
+-	}
 -	return []string{chatCompletionsPath, chatConsolePath}
 +	return []string{chatCompletionsPath}
  }
@@ -377,3 +478,100 @@ index c170a35..eb4a967 100644
  	}
  }
  
+diff --git a/internal/upstream/gzip_body_test.go b/internal/upstream/gzip_body_test.go
+index 6f561e2..dc0f2e0 100644
+--- a/internal/upstream/gzip_body_test.go
++++ b/internal/upstream/gzip_body_test.go
+@@ -6,7 +6,6 @@ import (
+ 	"io"
+ 	"net/http"
+ 	"testing"
+-	"time"
+ 
+ 	"workbuddy2api/internal/auth"
+ )
+@@ -70,39 +69,6 @@ func TestGzipUnsupported(t *testing.T) {
+ 	}
+ }
+ 
+-// TestChannelBlockedReordersPaths 被渠道校验拦过的账号优先走 /console（issue #296）。
+-func TestChannelBlockedReordersPaths(t *testing.T) {
+-	c := &Client{}
+-	a := &auth.Auth{UID: "u1"}
+-	if got := c.chatPaths(a); got[0] != chatCompletionsPath {
+-		t.Fatalf("默认应 /v2 优先，got %v", got)
+-	}
+-	c.markChannelBlocked("u1")
+-	got := c.chatPaths(a)
+-	if got[0] != chatConsolePath || got[1] != chatCompletionsPath {
+-		t.Fatalf("命中渠道校验后应 /console 优先，got %v", got)
+-	}
+-	// 未命中的其他账号不受影响
+-	if other := c.chatPaths(&auth.Auth{UID: "u2"}); other[0] != chatCompletionsPath {
+-		t.Fatalf("其他账号应保持 /v2 优先，got %v", other)
+-	}
+-}
+-
+-// TestChannelBlockExpires TTL 到期后回落 /v2 主路径。
+-func TestChannelBlockExpires(t *testing.T) {
+-	c := &Client{}
+-	c.markChannelBlocked("u1")
+-	c.channelBlockedMu.Lock()
+-	c.channelBlocked["u1"] = time.Now().Add(-time.Minute) // 已过期
+-	c.channelBlockedMu.Unlock()
+-	if c.channelBlockedFor("u1") {
+-		t.Fatal("过期后不该再判为命中")
+-	}
+-	if got := c.chatPaths(&auth.Auth{UID: "u1"}); got[0] != chatCompletionsPath {
+-		t.Fatalf("过期后应回落 /v2，got %v", got)
+-	}
+-}
+-
+ // TestIsChannelCheckMatchesPlain11128 issue #296 的现场报文（code 11128）。
+ func TestIsChannelCheckMatchesPlain11128(t *testing.T) {
+ 	body := `{"code":11128,"msg":"request illegal","requestId":"x",` +
+@@ -110,27 +76,30 @@ func TestIsChannelCheckMatchesPlain11128(t *testing.T) {
+ 	if !IsChannelCheck(body) {
+ 		t.Fatal("11128 + channel verification 必须识别为渠道校验")
+ 	}
+-	if got := Classify(400, body); got != ErrAccountFault {
+-		t.Fatalf("11128 渠道校验应归 ErrAccountFault，got %v", got)
++	if got := Classify(400, body); got != ErrChannelRejected {
++		t.Fatalf("11128 渠道校验应归 ErrChannelRejected，got %v", got)
+ 	}
+ }
+ 
+-// TestChannelCheckResendsOnceOnBothPaths 两条路径都被渠道校验拦时，原样重发一次
+-// （issue #296：上游报文自己写着「请求被拦截，请重新发送」），仍失败才返回错误。
+-func TestChannelCheckResendsOnceOnBothPaths(t *testing.T) {
++// Repeated requests must retain the primary path without channel retry memory.
++func TestChannelRejectionDoesNotRetryOrRememberPaths(t *testing.T) {
+ 	channel := `{"code":11128,"msg":"request illegal","displayTips":{"en":"This channel verification failed"}}`
+-	var calls int
++	calls := 0
+ 	c := testClient(func(r *http.Request) (*http.Response, error) {
+ 		calls++
+-		return jsonResp(400, channel), nil
++		if r.URL.Path != chatCompletionsPath {
++			t.Fatalf("unexpected path: %s", r.URL.Path)
++		}
++		return jsonResp(401, channel), nil
+ 	})
+-	a := &auth.Auth{AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}
+-	_, _, _, err := c.ChatStream(a, []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}`), "", ChatMeta{})
+-	if err == nil {
+-		t.Fatal("两条路径 + 重发都被拦时应返回错误")
++	a := &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}
++	for i := 0; i < 2; i++ {
++		_, status, _, err := c.ChatStream(a, []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}`), "", ChatMeta{})
++		if status != 401 || err == nil {
++			t.Fatalf("want original rejection: status=%d err=%v", status, err)
++		}
+ 	}
+-	// /v2 + /console + 重发 1 次 = 3 次
+-	if calls != 3 {
+-		t.Fatalf("calls=%d want 3（/v2、/console、重发一次）", calls)
++	if calls != 2 {
++		t.Fatalf("calls=%d want 2", calls)
+ 	}
+ }
