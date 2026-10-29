@@ -1,8 +1,8 @@
 diff --git a/internal/server/channel_check_test.go b/internal/server/channel_check_test.go
-index d81a9fc..0bcf4f7 100644
+index 8bdbc89..bf384eb 100644
 --- a/internal/server/channel_check_test.go
 +++ b/internal/server/channel_check_test.go
-@@ -12,12 +12,7 @@ import (
+@@ -13,12 +13,7 @@ import (
  	"workbuddy2api/internal/upstream"
  )
  
@@ -16,7 +16,7 @@ index d81a9fc..0bcf4f7 100644
  
  // channelCheckBody 一次渠道校验的封套。业务码拼接构造，避免手抄整串出错。
  func channelCheckBody() string {
-@@ -39,7 +34,7 @@ func sseResponse(status int, body string) *http.Response {
+@@ -40,7 +35,7 @@ func sseResponse(status int, body string) *http.Response {
  	}
  }
  
@@ -25,7 +25,7 @@ index d81a9fc..0bcf4f7 100644
  	var paths []string
  	up := &upstream.Client{
  		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-@@ -58,29 +53,19 @@ func TestChatFallsBackToConsoleOnChannelCheck(t *testing.T) {
+@@ -59,23 +54,15 @@ func TestChatFallsBackToConsoleOnChannelCheck(t *testing.T) {
  	rec := httptest.NewRecorder()
  	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
  		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
@@ -36,13 +36,13 @@ index d81a9fc..0bcf4f7 100644
 -	for _, p := range paths {
 -		sawV2 = sawV2 || strings.Contains(p, "/v2/chat/completions")
 -		sawConsole = sawConsole || strings.Contains(p, "/console/chat/completions")
-+	if rec.Code != 400 || !strings.Contains(rec.Body.String(), "channel_rejected") {
-+		t.Fatalf("want original channel rejection: %d %s", rec.Code, rec.Body.String())
++	if rec.Code != 400 || !strings.Contains(rec.Body.String(), "11128") {
++		t.Fatalf("original rejection lost: status=%d body=%s", rec.Code, rec.Body.String())
  	}
 -	if !sawV2 || !sawConsole {
 -		t.Fatalf("应先在 /v2 被拒再换 /console，实际路径=%v", paths)
 +	if len(paths) != 1 || paths[0] != "/v2/chat/completions" {
-+		t.Fatalf("must not try another endpoint: %v", paths)
++		t.Fatalf("unexpected paths: %v", paths)
  	}
  	st, _ := p.Status("u1")
 -	if st.Disabled {
@@ -50,34 +50,49 @@ index d81a9fc..0bcf4f7 100644
 -	}
 -	if st.Cooling {
 -		t.Error("换路径已经成功，账号不该被冷却")
-+	if st.Disabled || st.Cooling || st.ConsecutiveFails != 0 || len(st.RateLimitedModels) != 0 {
-+		t.Fatalf("account state changed: %+v", st)
++	if st.Disabled || st.Cooling || st.ConsecutiveFails != 0 {
++		t.Fatalf("request rejection changed account: %+v", st)
  	}
  }
  
- func TestChatChannelCheckNeverDisables(t *testing.T) {
--	// 两条路径都被渠道校验拒：软冷却（退出轮换、别被反复选中），但**不禁用** ——
--	// 禁用会写「需重新登录」，把用户指向错误的排查方向（凭证是好的）。
+@@ -140,11 +127,8 @@ func TestConsoleFallbackModelMissingDoesNotBlockModel(t *testing.T) {
+ 	}
+ }
+ 
+-// 11128 按 system 内容判定：合法系统提示词不该把账号拖下水。
+-//
+-// 同一请求体先被渠道校验拦下（/v2 与 /console 都拒），handler 把 system 文本
+-// 搬进首条 user 后重试成功；账号不冷却、不禁用。
+-func TestChatChannelCheckMovesSystemIntoUserAndRetries(t *testing.T) {
++// Preserve the original system message and stop after one channel rejection.
++func TestChatChannelCheckPreservesSystemWithoutRetry(t *testing.T) {
+ 	var bodies []string
  	up := &upstream.Client{
  		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
- 			return sseResponse(400, channelCheckBody()), nil
-@@ -98,11 +83,8 @@ func TestChatChannelCheckNeverDisables(t *testing.T) {
- 	if st.Disabled {
- 		t.Fatalf("渠道校验**绝不能**禁用账号（用户报告的症状）：reason=%q", st.DisabledReason)
- 	}
--	if !st.Cooling || st.CoolKind != "soft_rate" {
--		t.Fatalf("两条路径都被拒时应软冷却让它退出轮换：%+v", st)
+@@ -166,18 +150,8 @@ func TestChatChannelCheckMovesSystemIntoUserAndRetries(t *testing.T) {
+ 		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[`+
+ 			`{"role":"system","content":"PERSONA-SAFE"},`+
+ 			`{"role":"user","content":"hi"}]}`)))
+-	if rec.Code != 200 {
+-		t.Fatalf("system 文本搬进 user 后应成功，got code=%d body=%s", rec.Code, rec.Body.String())
 -	}
--	if !strings.Contains(st.Reason, "channel check") {
--		t.Errorf("冷却原因应写明是渠道校验，便于排障：%q", st.Reason)
-+	if st.Cooling || st.ConsecutiveFails != 0 || len(st.RateLimitedModels) != 0 {
-+		t.Fatalf("channel rejection must not penalize account: %+v", st)
+-	if len(bodies) < 2 {
+-		t.Fatalf("应至少重试一次，实际上游请求 %d 次", len(bodies))
+-	}
+-	last := bodies[len(bodies)-1]
+-	if systemHasPersona([]byte(last)) {
+-		t.Fatalf("重试请求仍是原始 system，未搬迁: %s", last)
+-	}
+-	if !strings.Contains(last, "PERSONA-SAFE") {
+-		t.Fatalf("重试请求丢了 system 文本: %s", last)
++	if rec.Code != 400 || len(bodies) != 1 || !systemHasPersona([]byte(bodies[0])) {
++		t.Fatalf("must preserve system and stop: status=%d requests=%d", rec.Code, len(bodies))
  	}
- }
- 
+ 	st, _ := p.Status("u1")
+ 	if st.Cooling || st.Disabled {
 diff --git a/internal/server/channel_rejected_test.go b/internal/server/channel_rejected_test.go
 new file mode 100644
-index 0000000..0163dbc
+index 0000000..e9b7282
 --- /dev/null
 +++ b/internal/server/channel_rejected_test.go
 @@ -0,0 +1,57 @@
@@ -103,7 +118,7 @@ index 0000000..0163dbc
 +		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 +			calls++
 +			return &http.Response{
-+				StatusCode: 400,
++				StatusCode: http.StatusUnauthorized,
 +				Header:     http.Header{"Content-Type": []string{"application/json"}},
 +				Body:       io.NopCloser(strings.NewReader(channelRejectedBody)),
 +			}, nil
@@ -115,14 +130,14 @@ index 0000000..0163dbc
 +		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
 +		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
 +	)
-+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: 600 * time.Second})
++	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: 600 * time.Second, PromptMode: "passthrough"})
 +
 +	rec := httptest.NewRecorder()
 +	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
-+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
++		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"system","content":"original system"},{"role":"user","content":"hi"}]}`)))
 +
-+	if rec.Code != http.StatusBadRequest {
-+		t.Fatalf("应回 400（渠道拒绝），got %d body=%s", rec.Code, rec.Body.String())
++	if rec.Code != http.StatusUnauthorized {
++		t.Fatalf("应保留 HTTP 401（渠道拒绝），got %d body=%s", rec.Code, rec.Body.String())
 +	}
 +	if calls != 1 {
 +		t.Errorf("不该轮转（同一 body 换号结果不变，白扔配额）：上游被调用了 %d 次", calls)
@@ -138,25 +153,65 @@ index 0000000..0163dbc
 +		}
 +	}
 +}
+diff --git a/internal/server/channel_request_scope_test.go b/internal/server/channel_request_scope_test.go
+index 15b79d1..7bafb6e 100644
+--- a/internal/server/channel_request_scope_test.go
++++ b/internal/server/channel_request_scope_test.go
+@@ -32,7 +32,7 @@ func TestChannelRejectionIsRequestScoped(t *testing.T) {
+ 			if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "11128") {
+ 				t.Fatalf("must expose original channel rejection: status=%d body=%s", rec.Code, rec.Body.String())
+ 			}
+-			if len(accounts) != 1 || calls > 3 {
++			if len(accounts) != 1 || calls != 1 {
+ 				t.Fatalf("must not rotate the rejected request across accounts: accounts=%v calls=%d", accounts, calls)
+ 			}
+ 			for _, st := range p.List() {
 diff --git a/internal/server/handler.go b/internal/server/handler.go
-index c198049..4b4dc7f 100644
+index 59faa63..5de8d59 100644
 --- a/internal/server/handler.go
 +++ b/internal/server/handler.go
-@@ -819,6 +819,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
- 			// 不喂连败），fail 只释放租约。error-passthrough：message 装上游 body 原文
- 			// （code/msg/requestId 原样，含真实 token 数与上限值——上游原文是最有价值
- 			// 的错误信息，客户端必须看到，禁止固定词覆盖）。
+@@ -619,9 +619,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 	// 降级裁决：append 在降级期退化为 replace（Rewrite(Degraded)）——append 带
+ 	// 指纹原文重试是确定性再撞墙，replace 是一次性最小抢救（issue #129 设计 §4）。
+ 	degradedApplied := false
+-	// 11128 请求级抢救：把 system 文本搬进首条 user 只做一次（搬两次没有意义，
+-	// 第二次仍被拦说明触发词在 user 侧或请求其它部分）。
+-	systemMoved := false
+ 	if h.cfg.PromptMode == "custom" && h.cfg.PromptText != "" {
+ 		body = prompt.Rewrite(body, h.cfg.PromptText)
+ 	} else if h.cfg.PromptMode == "append" && h.cfg.PromptText != "" && !h.degrade.Active() {
+@@ -805,26 +802,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 				kind = upstream.Classify(status, string(respBody))
+ 				uerr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+ 			}
+-			// 渠道校验是本次请求被拒，不能据此给整个账号写冷却。先做一次
+-			// 请求级抢救（system 文本搬进首条 user），仍被拦就透传原始拒绝并
+-			// 停止换号，避免同一报文连坐整个账号池。
+-			if upstream.IsChannelCheck(string(respBody)) {
+-				if kind == upstream.ErrAccountFault && !systemMoved &&
+-					(h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") {
+-					if moved, ok := prompt.MoveSystemToUser(body); ok {
+-						body = moved
+-						systemMoved = true
+-						// 单账号池也能拿到重试机会（重试占一次轮换名额，与原账号解绑）。
+-						delete(tried, acct.UID)
+-						releaseHeld()
+-						log.Printf("WARN: [server] channel-check (system content) -> moved system into user, retry")
+-						continue
+-					}
+-				}
++			// Channel rejection belongs to this request, even when HTTP status is 401.
 +			if kind == upstream.ErrChannelRejected {
-+				fail(acct.UID)
+ 				fail(acct.UID)
+-				st.status = status
+-				writeOpenAIErrorHint(w, status, "channel_check_rejected", string(respBody),
+-					"upstream channel verification rejected this request; account availability is unchanged")
 +				writeOpenAIErrorHint(w, status, "channel_rejected", string(respBody),
 +					"upstream rejected this request channel; no account cooldown applied")
-+				st.status = status
-+				return
-+			}
- 			if kind == upstream.ErrPromptTooLong {
- 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
- 				fail(acct.UID)
-@@ -1091,8 +1098,6 @@ func rotateBackoff(i int, ctx context.Context) bool {
+ 				return
+ 			}
+ 			// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，
+@@ -1137,8 +1119,6 @@ func rotateBackoff(i int, ctx context.Context) bool {
  //     达到 breakerThreshold 触发熔断（指数退避）。
  //   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11102 负缓存避让（复用 modelCooldowns
  //     机制，Until=指数退避 TTL，选号侧 healthyForModel 避开，切模型即可用）。
@@ -165,7 +220,7 @@ index c198049..4b4dc7f 100644
  //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断；ErrClient
  //     额外喂连败计数（NoteFailures，issue #114）：未知 4xx 连败 N 次临时出池——
  //     「不知道原因的兜底」，与冷却「知道原因的惩罚」并存取更长者不叠加（health
-@@ -1228,6 +1233,9 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
+@@ -1273,6 +1253,9 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
  		// 内容策略拦截：内容问题非账号问题，不罚账号（无冷却/熔断/NoteError）。
  		// passthrough 首遇由 chatCompletions 内降级重试处理；最终仍拦则回 400
  		// content_blocked（防火墙文案），不再轮转、不暴露账号/冷却/错误码。
@@ -207,7 +262,7 @@ index 43fb550..abd71c6 100644
  	}
  }
 diff --git a/internal/upstream/client.go b/internal/upstream/client.go
-index 0e5efd6..74d660e 100644
+index 1455e34..9fb7f1d 100644
 --- a/internal/upstream/client.go
 +++ b/internal/upstream/client.go
 @@ -58,10 +58,13 @@ const (
@@ -272,12 +327,7 @@ index 0e5efd6..74d660e 100644
  		strings.Contains(lower, "official client")
  }
  
-@@ -1247,14 +1240,10 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
- 	}
- 	paths := c.chatPaths(a)
- 	// 请求体压缩（issue #297）：>64KB 才压；Compressed 为空表示未压缩。
--	// 这里算一次、循环内复用：路径回落（/v2 → /console）不需要重新压。
-+	// 这里算一次；压缩不受支持时在同一路径重发未压缩请求。
+@@ -1251,14 +1244,6 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
  	outBody, contentEncoding := c.outboundBody(prepared)
  	// gzipRetried 防止「压缩版失败 → 未压缩重试」再次进入同一分支。
  	gzipRetried := false
@@ -285,10 +335,14 @@ index 0e5efd6..74d660e 100644
 -	// （issue #296：上游报文明确写着「请求被拦截，请重新发送」，说明它期望
 -	// 客户端重试；灰度校验有概率性，同一请求重发一次常能通过）。
 -	channelRetried := false
+-	// primaryChannel* 记录 /v2 的渠道拒绝原文：/console 兜底只报 11102 时返回它，
+-	// 让调用方看到真实原因（11128），而不是备用路径缺模型。
+-	var primaryChannelRaw []byte
+-	var primaryChannelErr *Error
  	for i := 0; i < len(paths); i++ {
  		path := paths[i]
  		url := c.chatBase(a) + path
-@@ -1295,7 +1284,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
+@@ -1299,7 +1284,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
  			// 上游不接受压缩请求体（issue #297 兜底）：改成未压缩重发**同一条路径**。
  			// 只重试一次，且只对 415 / 「解析失败」类 400 生效 —— 其他 4xx 是请求本身
  			// 的问题，重发只是多打一次上游。
@@ -297,7 +351,7 @@ index 0e5efd6..74d660e 100644
  				gzipUnsupported(resp.StatusCode, string(raw)) {
  				gzipRetried = true
  				contentEncoding = ""
-@@ -1308,47 +1297,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
+@@ -1312,79 +1297,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
  			kind := Classify(resp.StatusCode, string(raw))
  			log.Printf("WARN: [upstream] chat_stream acct=%s: upstream %d %s body=%s",
  				logfmt.Label(a.UID, a.Nickname), resp.StatusCode, kind, truncate(string(raw), 200))
@@ -306,10 +360,23 @@ index 0e5efd6..74d660e 100644
 -			// 不是「该账号缺这个模型」。照 ErrModelBlocked 处理，handler 会写 (账号,模型)
 -			// 6 小时负缓存，逐个账号轮过去就是整池 503 no_healthy_account，比不换路径更糟。
 -			// 也不按 ErrClient 处理：连败计数是账号健康信号，这里失败的是路径不是账号。
--			if i > 0 && kind == ErrModelBlocked {
+-			if kind == ErrModelBlocked && (i > 0 || path == chatConsolePath) {
 -				log.Printf("WARN: [upstream] chat_stream acct=%s: 回退路径 %s 报 %s，按请求级处理（不写模型冷却）",
 -					logfmt.Label(a.UID, a.Nickname), path, kind)
+-				// 判据按路径而非候选序号（2026-10-28）：撞过渠道校验后 chatPaths 会把 /console
+-				// 排到首位，那时 11102 落在 i == 0，旧条件不成立，就被当成「该账号缺这个模型」写
+-				// 6 小时负缓存；逐个账号轮过去就是整池 503 no_healthy_account。
+-				// /console 报 11102 只说明这条路径没有该模型（或两端模型命名空间不同），
+-				// 所以还要换回 /v2 继续试，别把请求直接判死。
+-				if path == chatConsolePath && i < len(paths)-1 {
+-					log.Printf("WARN: [upstream] chat_stream acct=%s: %s 无此模型，换路径 %s 重试",
+-						logfmt.Label(a.UID, a.Nickname), path, paths[i+1])
+-					continue
+-				}
 -				kind = ErrFallbackModelMissing
+-				if primaryChannelErr != nil {
+-					return nil, primaryChannelErr.Status, primaryChannelRaw, primaryChannelErr
+-				}
 -			}
 -			// 路径级拒绝 → 换下一个候选路径再试，**不**把它当账号问题。
 -			//   · 渠道校验（11128/11-128）：/v2 新增强校验，/console 放行（见 chatPaths）；
@@ -320,6 +387,25 @@ index 0e5efd6..74d660e 100644
 -			// 失败仍按下面原有逻辑返回，由 handler 决定怎么罚号 —— 那时也**不该禁用**
 -			// （见 handler 的 ErrAccountFault 分支）。
 -			if IsChannelCheck(string(raw)) {
+-				if path == chatCompletionsPath {
+-					primaryChannelRaw = raw
+-					primaryChannelErr = &Error{Kind: kind, Status: resp.StatusCode, Msg: string(raw)}
+-				}
+-				// 压缩请求体本身就是一条「不像官方客户端」的信号（issue #303：
+-				// DSH 长上下文被 gzip 后稳定吃 11128，同一 body 不压缩即 200）。
+-				// 命中渠道校验时**先**去掉压缩重发同一条路径：gzip 只是省带宽的
+-				// 优化，不值得为它换来一整轮失败。这一步放在 markChannelBlocked
+-				// 之前 —— 去掉压缩后成功就说明账号没问题，不该给它留下「渠道受限」
+-				// 记忆（否则后续 10 分钟白走 /console）。
+-				if contentEncoding != "" && !gzipRetried {
+-					gzipRetried = true
+-					contentEncoding = ""
+-					outBody = prepared
+-					log.Printf("WARN: [upstream] chat_stream acct=%s: 渠道校验命中且请求体是压缩的，改用未压缩重试",
+-						logfmt.Label(a.UID, a.Nickname))
+-					i--
+-					continue
+-				}
 -				// 记下这个账号被渠道校验拦过：后续请求优先走 /console（issue #296），
 -				// 不必每次都先撞一次 /v2。TTL 到期自动回落，上游策略变化后不会卡在
 -				// 次优路径上。
@@ -342,11 +428,11 @@ index 0e5efd6..74d660e 100644
 -			}
 -			// ≥400 直接返回（除上面的渠道校验换路径外，chat 层无 fallback 链；billing
 -			// 层的 404 fallback 独立存在，语义不受影响）。
-+			// 保留原始拒绝；不换路径、不重发、不修改账号健康状态。
++			// Preserve the first rejection without changing paths or retrying.
  			// 分类一次、随 Kind 信封返回（含 Retry-After 头解析，P1-2）：
  			// ErrNone 是防御分支（≥400 不应产生 None），返回原文让 handler 兜底。
  			if kind == ErrNone {
-@@ -1375,10 +1324,6 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
+@@ -1411,10 +1324,6 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
  // 只有 ~1Mbps 时首字节要等 20-30 秒 —— 压到 1/4.5 就是实打实的提速。
  const gzipBodyThreshold = 64 << 10
  
@@ -357,7 +443,7 @@ index 0e5efd6..74d660e 100644
  // outboundBody 按配置决定 chat 请求体是否压缩，返回最终 body 与 Content-Encoding。
  // gzip 失败（理论上只有内存不足）时原样返回未压缩 body，不阻断请求。
  func (c *Client) outboundBody(body []byte) ([]byte, string) {
-@@ -1429,61 +1374,9 @@ func gzipUnsupported(status int, raw string) bool {
+@@ -1465,66 +1374,9 @@ func gzipUnsupported(status int, raw string) bool {
  	return false
  }
  
@@ -408,12 +494,17 @@ index 0e5efd6..74d660e 100644
 -// 等命令执行特征确定性 403），所以把 /v2 定为主路径 —— 这一点没变：**只有** /v2 被判定为
 -// 渠道校验时才换 /console（见 ChatStreamContext 的 fallback 条件），主路径行为零改动。
 -// 这也正是 #119 注释里写的「若上游未来关闭 /v2，届时应重新启用 /console」。
-+// chatPaths 使用主接口；渠道拒绝直接返回，避免备用接口覆盖原始错误。
++// Channel rejection does not change the endpoint used by future requests.
  func (c *Client) chatPaths(a *auth.Auth) []string {
 -	// 被渠道校验拦过的账号：优先走官方客户端路径 /console（issue #296）。
 -	// /v2 仍是主路径（#119 的 /console WAF 取舍不变），这里只调整**顺序**：
 -	// 上一次撞过 11128 的账号，下一轮不必再白跑一次 /v2。
--	if a != nil && c.channelBlockedFor(a.UID) {
+-	//
+-	// 仅对 global 生效：CN 的 /console 不提供 deepseek-v4.1-flash 等模型，提前换过去
+-	// 会让该账号之后 10 分钟的**所有**请求都吃 11102（model service info not found）。
+-	// 一个账号被 11128 拦一次就把整池打成 503，比原问题更严重；CN 保持 /v2 优先，
+-	// 11128 由调用方按请求级处理。
+-	if a != nil && a.Realm() != "cn" && c.channelBlockedFor(a.UID) {
 -		return []string{chatConsolePath, chatCompletionsPath}
 -	}
 -	return []string{chatCompletionsPath, chatConsolePath}
@@ -422,7 +513,7 @@ index 0e5efd6..74d660e 100644
  
  // ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens + 上游模型对象全字段）。
 diff --git a/internal/upstream/client_test.go b/internal/upstream/client_test.go
-index ceb1dca..4991919 100644
+index ba68600..4b5732a 100644
 --- a/internal/upstream/client_test.go
 +++ b/internal/upstream/client_test.go
 @@ -283,7 +283,6 @@ func TestClassifyContentBlocked(t *testing.T) {
@@ -433,8 +524,110 @@ index ceb1dca..4991919 100644
  	} {
  		if got := Classify(400, body); got != ErrContentBlocked {
  			t.Errorf("Classify(400, %q)=%v want ErrContentBlocked", body, got)
+@@ -1047,28 +1046,12 @@ func TestRefreshTokenExpiresInWithinCapApplied(t *testing.T) {
+ 	}
+ }
+ 
+-// issue #296 后续：/console 优先只能用于 global。
+-//
+-// CN 的 /console 不提供 deepseek-v4.1-flash 等模型，账号一旦在 /v2 撞过 11128，
+-// 提前换到 /console 会让它之后 10 分钟的每个请求都吃 11102，一个号被拦一次就能
+-// 把整池打成 503。
+-func TestChatPathsConsoleFirstOnlyForGlobal(t *testing.T) {
++// Both realms retain the primary endpoint after request-scoped failures.
++func TestChatPathsUsePrimaryForBothRealms(t *testing.T) {
+ 	c := &Client{}
+-	cn := &auth.Auth{UID: "cn1", Domain: "www.codebuddy.cn"}
+-	global := &auth.Auth{UID: "g1", Domain: "www.workbuddy.ai"}
+-
+-	c.markChannelBlocked(cn.UID)
+-	if got := c.chatPaths(cn); len(got) != 2 || got[0] != chatCompletionsPath {
+-		t.Fatalf("CN 账号撞过渠道校验后仍应 /v2 优先，got %v", got)
+-	}
+-
+-	c.markChannelBlocked(global.UID)
+-	if got := c.chatPaths(global); len(got) != 2 || got[0] != chatConsolePath {
+-		t.Fatalf("global 账号撞过渠道校验后应 /console 优先（issue #296），got %v", got)
+-	}
+-
+-	fresh := &auth.Auth{UID: "new1", Domain: "www.workbuddy.ai"}
+-	if got := c.chatPaths(fresh); got[0] != chatCompletionsPath {
+-		t.Fatalf("未撞过渠道校验的账号应 /v2 优先，got %v", got)
++	for _, domain := range []string{"www.codebuddy.cn", "www.workbuddy.ai"} {
++		if paths := c.chatPaths(&auth.Auth{UID: "u1", Domain: domain}); len(paths) != 1 || paths[0] != chatCompletionsPath {
++			t.Fatalf("domain=%s paths=%v", domain, paths)
++		}
+ 	}
+ }
+diff --git a/internal/upstream/console_first_model_missing_test.go b/internal/upstream/console_first_model_missing_test.go
+index 81c0093..84cd80b 100644
+--- a/internal/upstream/console_first_model_missing_test.go
++++ b/internal/upstream/console_first_model_missing_test.go
+@@ -9,17 +9,8 @@ import (
+ 	"workbuddy2api/internal/auth"
+ )
+ 
+-// 复现 2026-10-28 整池负缓存事故的真实触发顺序。
+-//
+-// 现场：/v2 撞 11128（渠道校验）后 markChannelBlocked 记 10 分钟，之后 chatPaths 把
+-// /console 排到首位。这时 /console 报 11102 落在 i == 0，旧判据
+-// `if i > 0 && kind == ErrModelBlocked` 不成立，11102 被当成「该账号缺这个模型」，
+-// handler 写 6 小时负缓存；十几个号轮一圈就是整池 503 no_healthy_account。
+-//
+-// 修复后的判据按路径走：/console 自己报 11102 一律降级，且还有候选时换回 /v2 继续试。
+-// 所以这条用例在修复前必须失败（err 非空且 Kind == ErrModelBlocked、只走了一条路径），
+-// 修复后必须成功返回 200。
+-func TestChannelBlockedConsoleFirstModelMissingFallsBack(t *testing.T) {
++// A rejected request must not move the next request to a missing-model endpoint.
++func TestChannelRejectionDoesNotPoisonNextRequest(t *testing.T) {
+ 	var paths []string
+ 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		paths = append(paths, r.URL.Path)
+@@ -29,7 +20,12 @@ func TestChannelBlockedConsoleFirstModelMissingFallsBack(t *testing.T) {
+ 			_, _ = w.Write([]byte(`{"code":11102,"msg":"model [deepseek-v4.1-flash] service info not found"}`))
+ 			return
+ 		}
+-		// /v2 正常放行：修复后应当换回来并成功。
++		if len(paths) == 1 {
++			w.WriteHeader(http.StatusBadRequest)
++			_, _ = w.Write([]byte(channelBody))
++			return
++		}
++
+ 		w.Header().Set("Content-Type", "text/event-stream")
+ 		w.WriteHeader(http.StatusOK)
+ 		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
+@@ -38,13 +34,11 @@ func TestChannelBlockedConsoleFirstModelMissingFallsBack(t *testing.T) {
+ 
+ 	c := New()
+ 	c.ChatBaseCN = srv.URL
+-	// 用 global 账号：只有 global 会因渠道校验把 /console 提前（CN 保持 /v2 优先，
+-	// 见 0032-console-first-global-only）。分类判定本身与 realm 无关，这里覆盖的是
+-	// 「/console 排首位时 11102 不能被升级成 model_blocked」，所以仍要能构造出该顺序。
+-	acct := &auth.Auth{UID: "g1", AccessToken: "at", ExpiresAt: 9999999999,
+-		Domain: "www.workbuddy.ai"}
+-	// 关键前置：模拟「撞过 11128」，chatPaths 因此返回 [/console, /v2]。
+-	c.markChannelBlocked("g1")
++	acct := &auth.Auth{UID: "g1", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"}
++	_, rejected, _, firstErr := c.ChatStream(acct, []byte(`{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"first"}]}`), "", ChatMeta{})
++	if rejected != 400 || firstErr == nil || len(paths) != 1 {
++		t.Fatalf("first request: status=%d err=%v paths=%v", rejected, firstErr, paths)
++	}
+ 
+ 	body, status, raw, err := c.ChatStream(acct,
+ 		[]byte(`{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`), "", ChatMeta{})
+@@ -58,7 +52,7 @@ func TestChannelBlockedConsoleFirstModelMissingFallsBack(t *testing.T) {
+ 	if body != nil {
+ 		body.Close()
+ 	}
+-	if len(paths) != 2 || !strings.Contains(paths[0], "/console/") || !strings.Contains(paths[1], "/v2/") {
+-		t.Fatalf("应当先走 /console 再换回 /v2，实际路径=%v", paths)
++	if len(paths) != 2 || !strings.Contains(paths[0], "/v2/") || !strings.Contains(paths[1], "/v2/") {
++		t.Fatalf("两次请求都应走 /v2，实际路径=%v", paths)
+ 	}
+ }
 diff --git a/internal/upstream/fallback_model_missing_test.go b/internal/upstream/fallback_model_missing_test.go
-index c170a35..eb4a967 100644
+index a3f518b..7773aa4 100644
 --- a/internal/upstream/fallback_model_missing_test.go
 +++ b/internal/upstream/fallback_model_missing_test.go
 @@ -9,15 +9,8 @@ import (
@@ -455,56 +648,57 @@ index c170a35..eb4a967 100644
  	var paths []string
  	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
  		paths = append(paths, r.URL.Path)
-@@ -39,15 +32,18 @@ func TestConsoleFallbackModelMissingIsRequestLevel(t *testing.T) {
- 	if status != http.StatusBadRequest {
- 		t.Fatalf("status=%d body=%s", status, raw)
- 	}
-+	if string(raw) != channelBody {
-+		t.Fatalf("original error lost: %s", raw)
-+	}
- 	ue, ok := err.(*Error)
+@@ -43,11 +36,11 @@ func TestConsoleFallbackModelMissingIsRequestLevel(t *testing.T) {
  	if !ok {
  		t.Fatalf("应返回分类信封，got %T (%v)", err, err)
  	}
--	if ue.Kind != ErrFallbackModelMissing {
--		t.Fatalf("回退路径的 11102 应归请求级（ErrFallbackModelMissing），got %v", ue.Kind)
-+	if ue.Kind != ErrChannelRejected {
-+		t.Fatalf("渠道拒绝应归 ErrChannelRejected，got %v", ue.Kind)
+-	if ue.Kind != ErrAccountFault || string(raw) != channelBody {
++	if ue.Kind != ErrChannelRejected || string(raw) != channelBody {
+ 		t.Fatalf("应保留主路径的渠道拒绝，不让备用路径缺模型覆盖原始原因，got %v raw=%s", ue.Kind, raw)
  	}
 -	if len(paths) != 2 || !strings.Contains(paths[0], "/v2/") || !strings.Contains(paths[1], "/console/") {
 -		t.Fatalf("应当先在 /v2 被拒再换 /console，实际路径=%v", paths)
 +	if len(paths) != 1 || !strings.Contains(paths[0], "/v2/") {
-+		t.Fatalf("应当只请求 /v2，实际路径=%v", paths)
++		t.Fatalf("应当保留 /v2 拒绝、不换路径，实际路径=%v", paths)
  	}
  }
  
 diff --git a/internal/upstream/gzip_body_test.go b/internal/upstream/gzip_body_test.go
-index 6f561e2..dc0f2e0 100644
+index cd4d12a..a1ec16a 100644
 --- a/internal/upstream/gzip_body_test.go
 +++ b/internal/upstream/gzip_body_test.go
-@@ -6,7 +6,6 @@ import (
- 	"io"
- 	"net/http"
+@@ -8,7 +8,6 @@ import (
+ 	"net/http/httptest"
+ 	"strings"
  	"testing"
 -	"time"
  
  	"workbuddy2api/internal/auth"
  )
-@@ -70,39 +69,6 @@ func TestGzipUnsupported(t *testing.T) {
+@@ -72,48 +71,6 @@ func TestGzipUnsupported(t *testing.T) {
  	}
  }
  
--// TestChannelBlockedReordersPaths 被渠道校验拦过的账号优先走 /console（issue #296）。
+-// TestChannelBlockedReordersPaths 渠道校验记忆只对 global 提前 /console（#296 / #308）。
+-//
+-// CN 的 /console 不提供 deepseek-v4.1-flash 等模型：一旦把 /console 排到首位，
+-// 该账号之后 10 分钟的**每个**请求都会先吃一次必然失败的 11102，进而把整池写成
+-// 模型冷却。所以 CN 保持 /v2 优先，11128 由调用方按请求级处理。
 -func TestChannelBlockedReordersPaths(t *testing.T) {
 -	c := &Client{}
--	a := &auth.Auth{UID: "u1"}
--	if got := c.chatPaths(a); got[0] != chatCompletionsPath {
+-	cn := &auth.Auth{UID: "u1"}
+-	if got := c.chatPaths(cn); got[0] != chatCompletionsPath {
 -		t.Fatalf("默认应 /v2 优先，got %v", got)
 -	}
 -	c.markChannelBlocked("u1")
--	got := c.chatPaths(a)
--	if got[0] != chatConsolePath || got[1] != chatCompletionsPath {
--		t.Fatalf("命中渠道校验后应 /console 优先，got %v", got)
+-	if got := c.chatPaths(cn); got[0] != chatCompletionsPath {
+-		t.Fatalf("CN 账号即使命中渠道校验也应保持 /v2 优先，got %v", got)
+-	}
+-	// global 命中后提前 /console（#296 的行为保留）
+-	gl := &auth.Auth{UID: "g1", Domain: "www.workbuddy.ai"}
+-	c.markChannelBlocked("g1")
+-	if got := c.chatPaths(gl); got[0] != chatConsolePath || got[1] != chatCompletionsPath {
+-		t.Fatalf("global 命中渠道校验后应 /console 优先，got %v", got)
 -	}
 -	// 未命中的其他账号不受影响
 -	if other := c.chatPaths(&auth.Auth{UID: "u2"}); other[0] != chatCompletionsPath {
@@ -530,7 +724,7 @@ index 6f561e2..dc0f2e0 100644
  // TestIsChannelCheckMatchesPlain11128 issue #296 的现场报文（code 11128）。
  func TestIsChannelCheckMatchesPlain11128(t *testing.T) {
  	body := `{"code":11128,"msg":"request illegal","requestId":"x",` +
-@@ -110,27 +76,30 @@ func TestIsChannelCheckMatchesPlain11128(t *testing.T) {
+@@ -121,34 +78,36 @@ func TestIsChannelCheckMatchesPlain11128(t *testing.T) {
  	if !IsChannelCheck(body) {
  		t.Fatal("11128 + channel verification 必须识别为渠道校验")
  	}
@@ -573,5 +767,38 @@ index 6f561e2..dc0f2e0 100644
 -		t.Fatalf("calls=%d want 3（/v2、/console、重发一次）", calls)
 +	if calls != 2 {
 +		t.Fatalf("calls=%d want 2", calls)
+ 	}
+ }
+ 
+-// TestChannelCheckFallsBackToUncompressed 压缩请求体命中渠道校验时，先去压缩重试
+-// 同一条路径（issue #303：DSH 长上下文 gzip 后稳定 11128，不压缩即 200）。
+-func TestChannelCheckFallsBackToUncompressed(t *testing.T) {
++// A channel rejection must not trigger a compressed-to-uncompressed retry.
++func TestCompressedChannelRejectionDoesNotRetry(t *testing.T) {
+ 	channel := `{"code":11128,"msg":"request illegal","displayTips":{"en":"This channel verification failed"}}`
+ 	var gotEncoding []string
+ 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+@@ -173,19 +132,13 @@ func TestChannelCheckFallsBackToUncompressed(t *testing.T) {
+ 	big := `{"model":"m","messages":[{"role":"user","content":"` +
+ 		strings.Repeat("上下文", 30000) + `"}]}`
+ 	body, status, raw, err := c.ChatStream(acct, []byte(big), "", ChatMeta{})
+-	if err != nil {
+-		t.Fatalf("status=%d err=%v body=%s", status, err, raw)
+-	}
+-	if status != http.StatusOK {
+-		t.Fatalf("status=%d body=%s", status, raw)
+-	}
+ 	if body != nil {
+ 		body.Close()
+ 	}
+-	if len(gotEncoding) != 2 || gotEncoding[0] != "gzip" || gotEncoding[1] != "" {
+-		t.Fatalf("应当先发压缩、再去压缩重试，实际 Content-Encoding 序列=%v", gotEncoding)
++	if err == nil || status != http.StatusBadRequest || string(raw) != channel {
++		t.Fatalf("original rejection lost: status=%d error=%v body=%s", status, err, raw)
+ 	}
+-	if c.channelBlockedFor("u1") {
+-		t.Fatal("压缩重试成功的请求不该把账号标记成渠道受限")
++	if len(gotEncoding) != 1 || gotEncoding[0] != "gzip" {
++		t.Fatalf("channel rejection retried: encodings=%v", gotEncoding)
  	}
  }
