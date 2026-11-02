@@ -1,0 +1,59 @@
+diff --git a/cmd/activity/main.go b/cmd/activity/main.go
+index fa6ac4b..9bcd3ef 100644
+--- a/cmd/activity/main.go
++++ b/cmd/activity/main.go
+@@ -36,9 +36,9 @@ import (
+ // cfgFile 只取本工具需要的字段；Schedule 段直接用 internal/config.Schedule
+ // （与 cmd/server 同源），其余段保持精简内联。
+ type cfgFile struct {
+-	AuthDir   string            `json:"auth_dir"`
+-	StateFile string            `json:"state_file"`
+-	Schedule  config.Schedule   `json:"schedule"`
++	AuthDir   string          `json:"auth_dir"`
++	StateFile string          `json:"state_file"`
++	Schedule  config.Schedule `json:"schedule"`
+ 	Upstream  struct {
+ 		TimeoutSeconds int `json:"timeout_seconds"`
+ 	} `json:"upstream"`
+@@ -103,7 +103,7 @@ func main() {
+ 		CheckinHours:        c.Schedule.CheckinHours,
+ 		TravelHours:         c.Schedule.TravelHours,
+ 		ActivityHours:       c.Schedule.ActivityHours,
+-		KeepaliveHours:       c.Schedule.KeepaliveHours,
++		KeepaliveHours:      c.Schedule.KeepaliveHours,
+ 		ActivityReportCount: c.Schedule.ActivityReportCount,
+ 	})
+ 	sch.RunActivityNow()
+diff --git a/cmd/credit/main.go b/cmd/credit/main.go
+index 95136e1..f9752d2 100644
+--- a/cmd/credit/main.go
++++ b/cmd/credit/main.go
+@@ -156,4 +156,4 @@ func printPretty(accounts []accountResult, totalRemain, totalUsed, totalSize int
+ 	for _, f := range failed {
+ 		fmt.Printf("⚠️ %s\n", f)
+ 	}
+-}
+\ No newline at end of file
++}
+diff --git a/cmd/trial/main.go b/cmd/trial/main.go
+index dd43a8e..1700f8d 100644
+--- a/cmd/trial/main.go
++++ b/cmd/trial/main.go
+@@ -127,4 +127,3 @@ func main() {
+ 	fmt.Printf("\ntotal=%d ok=%d already=%d na=%d fail=%d\n",
+ 		len(rows), okN, alreadyN, notAppN, failN)
+ }
+-
+diff --git a/internal/server/handler_test.go b/internal/server/handler_test.go
+index 776c3e5..987a9da 100644
+--- a/internal/server/handler_test.go
++++ b/internal/server/handler_test.go
+@@ -2460,7 +2460,7 @@ func TestContentBlockedCustomIgnoresActiveDegrade(t *testing.T) {
+ }
+ 
+ // TestStaleSnapshotBoundedByPickGate 粘性快照陈旧被 Pick 闸兜底的契约锚
+-//（pr134-watchlist-analysis.md #10）：
++// （pr134-watchlist-analysis.md #10）：
+ // session.ResolveForModel 在取任何锁之前拿 pool 可用性快照——若快照后、Pick 前
+ // 粘性号 A 被冷却（快照陈旧判 available），Session 层仍会返回 A 作为建议 uid；
+ // 但真正的可用性权威闸是 handler 的 Pool.PickByUIDForModel（锁内新鲜判定
