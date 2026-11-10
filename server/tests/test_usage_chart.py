@@ -65,13 +65,13 @@ class UsageChartInvariantTest(unittest.TestCase):
         # 面积形态必须真的被渲染出来，不能只在纯函数里定义了却没人用
         self.assertIn('Area', code, '面积形态没接上（30/90 天仍会挤成一片柱子）')
 
-    def test_today_branch_fetches_hourly(self) -> None:
-        """`days === '1'` 时才请求小时端点 —— 其它范围不该白打一次请求。"""
+    def test_single_day_branch_fetches_selected_day_hourly(self) -> None:
+        """今日及自定义单日请求选定日期的小时数据；多日范围不请求。"""
         code = self.PAGE.read_text(encoding='utf-8')
         self.assertIn('statsApi.hourly(', code, '没有请求小时端点')
         self.assertRegex(
-            code, r"days === '1'[\s\S]{0,120}statsApi\.hourly\(",
-            '小时端点不是在「今日」分支里取的（要么永远在取、要么从不取）',
+            code, r"d === 1[\s\S]{0,120}statsApi\.hourly\(endDay, realm\)",
+            '小时数据必须仅在单日范围查询，且携带所选日期',
         )
 
     def test_lib_stays_runnable_without_node_modules(self) -> None:
