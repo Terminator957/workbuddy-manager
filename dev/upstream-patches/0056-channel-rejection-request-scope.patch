@@ -265,10 +265,14 @@ diff --git a/internal/upstream/client.go b/internal/upstream/client.go
 index 1455e34..9fb7f1d 100644
 --- a/internal/upstream/client.go
 +++ b/internal/upstream/client.go
-@@ -58,10 +58,13 @@ const (
+@@ -58,14 +58,17 @@ const (
  	// 一次误判就是永久杀号。故单列一类，由 handler 走「连续 N 次才禁用」的计数
  	// 路径（与 12153 的 NoteSessionDead 同口径、共用计数器）。
  	ErrAuthRejected
+ 	// ErrUpstreamQueue 上游「排队等待」（429 + 业务码 6020 / queue.waiting.title）
+ 	// 不是账号级限流：队列按账号等级全局共享，换号不会改变排队位置。账号不冷却、
+ 	// 不计数、不禁用；请求仍按 MaxRotate 轮转，最终以 429 返回让客户端等待。
+ 	ErrUpstreamQueue
 +	ErrChannelRejected // 渠道拒绝只终止当前请求，不改变账号状态。
  )
  
