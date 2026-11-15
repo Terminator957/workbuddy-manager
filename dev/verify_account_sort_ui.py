@@ -22,6 +22,7 @@ for i in range(23):
         is_expired=False, in_pool=True, healthy=True, credits=23-i,
         added_at=None if i == 0 else now+i, note=''))
 notes_saved = []
+order_saved = []
 
 
 class Quiet(SimpleHTTPRequestHandler):
@@ -42,6 +43,10 @@ try:
             if path == '/api/me': data = dict(username='fixture', role='admin')
             elif path == '/api/upstreams': data = dict(items=[dict(id=1,name='测试分组',auth_dir='/auths',enabled=True,is_default=True)])
             elif path == '/api/accounts': data = dict(total=len(accounts),accounts=accounts,manageable=True)
+            elif path == '/api/accounts/order':
+                if route.request.method == 'PUT':
+                    order_saved.append(route.request.post_data_json['order'])
+                data = dict(order=order_saved[-1] if order_saved else [])
             elif path == '/api/upstream/status': data = dict(connected=True,accounts=accounts,total=len(accounts),healthy=len(accounts),disabled=0)
             elif path == '/api/accounts/refresh-credits': data = dict(total=len(accounts),succeeded=len(accounts),failed=[],credits={a['uid']:a['credits'] for a in accounts},meta={})
             elif path == '/api/account-risk': data = dict(items=[],failed_groups=[],total=0)
@@ -67,6 +72,21 @@ try:
         def toggle(): page.get_by_role('button',name='点击切换排序方向',exact=False).click()
 
         first_is('账号00')
+        choose('自定义顺序')
+        expect(page.get_by_role('option',name='自定义顺序',exact=True)).to_have_count(0)
+        source = page.locator('tr[data-uid="u01"] td').first.bounding_box()
+        target = page.locator('tr[data-uid="u00"] td').first.bounding_box()
+        page.mouse.move(source['x']+30, source['y']+source['height']/2)
+        page.mouse.down()
+        page.wait_for_timeout(400)  # UI requires a 320ms long press.
+        page.mouse.move(target['x']+30, target['y']+5, steps=8)
+        first_is('账号01')
+        page.mouse.up()
+        expect(page.get_by_text('账号顺序已保存', exact=True)).to_be_visible()
+        assert order_saved[-1][0] == 'u01'
+        page.reload(wait_until='networkidle')
+        choose('自定义顺序'); first_is('账号01')
+        page.screenshot(path=str(shots/'manual-order-persisted.png'))
         choose('按有效期排序'); first_is('账号00')
         toggle(); first_is('账号22')
         choose('按积分排序'); first_is('账号22')
@@ -96,7 +116,7 @@ try:
         expect(page.get_by_role('button',name='点击切换排序方向',exact=False)).to_have_count(0)
         assert not errors, errors
         browser.close()
-    print('PASS: expiry/credits/added asc+desc, newest first, unknown last, correct-account note save, mobile layout, default order, no runtime errors; mocked APIs only')
+    print('PASS: long-press reorder saved and reloaded, expiry/credits/added asc+desc, newest first, unknown last, correct-account note save, mobile layout, default order, no runtime errors; mocked APIs only')
 finally:
     server.shutdown()
     server.server_close()
