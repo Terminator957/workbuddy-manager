@@ -190,3 +190,18 @@ new file mode 100644
 +		}
 +	}
 +}
+diff --git a/internal/upstream/agenttool_search.go b/internal/upstream/agenttool_search.go
+--- a/internal/upstream/agenttool_search.go
++++ b/internal/upstream/agenttool_search.go
+@@ -54,9 +54,8 @@
+ }
+ 
+ // IsQuotaExhausted 报告搜索响应是否为 web-search 日配额耗尽（业务码 15001，
+-// classifyErrorDetail: quota_web_search）。该配额是**账号级**的：
+-// 处置 = 该号软冷却 + 立即换号（与 6004 模型级冷却同构，但无模型豁免语义——
+-// 搜索没有模型维度）。
++// classifyErrorDetail: quota_web_search）。配额按账号计，但仅属于搜索能力：
++// 服务端只冷却该账号的 tool:web-search 作用域并换号，不能冷却聊天模型。
+ func (r *AgentToolSearchResponse) IsQuotaExhausted() bool {
+ 	return r.Code == 15001
+ }
