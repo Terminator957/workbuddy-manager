@@ -40,7 +40,7 @@ try:
                 else: data = []
             elif path == '/api/accounts': data = dict(accounts=[dict(realm='cn')])
             elif path == '/api/model-catalog':
-                data = dict(models=[dict(id=f'model-{i:02}', tags=[]) for i in range(40)])
+                data = dict(models=[dict(id=f'model-{i:02}', tags=[]) for i in range(40)]+[dict(id='hy4flash-free',tags=[])])
             elif path == '/api/keys/check-models': data = dict(checked=True, unknown=[])
             route.fulfill(status=200,content_type='application/json',body=json.dumps(data))
 
@@ -60,6 +60,12 @@ try:
         popup = page.locator('[data-slot="popover-content"]')
         expect(popup).to_be_visible()
         assert popup.evaluate("e => !!e.closest('[data-slot=dialog-content]')")
+        bounds=popup.bounding_box(); modal=dialog.bounding_box()
+        assert bounds['y'] >= modal['y'] and bounds['y']+bounds['height'] <= modal['y']+modal['height'], 'model picker clipped by modal'
+        popup.get_by_role('button',name='只看限时免费',exact=True).click()
+        expect(popup.get_by_role('checkbox',name='hy4flash-free 免费',exact=True)).to_be_visible()
+        expect(popup.get_by_role('checkbox',name='model-00',exact=True)).to_have_count(0)
+        popup.get_by_role('button',name='只看限时免费',exact=True).click()
         scroll = popup.locator('.overflow-y-auto')
         scroll.hover(); page.mouse.wheel(0,650)
         page.wait_for_function("document.querySelector('[data-slot=popover-content] .overflow-y-auto').scrollTop > 100")
@@ -78,6 +84,6 @@ try:
         page.screenshot(path=str(shots/'daily-quota-mobile.png'))
         assert not errors, errors
         context.close(); browser.close()
-    print('PASS: daily quota default=0, save=1500, model whitelist wheel works inside modal, selection saved, 390px form has no overflow, no page errors; mocked APIs only')
+    print('PASS: daily quota default=0, save=1500, model whitelist wheel works inside modal, selection saved, modal collision bounds and free suffix filter verified, 390px form has no overflow, no page errors; mocked APIs only')
 finally:
     server.shutdown(); server.server_close()
