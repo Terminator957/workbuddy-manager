@@ -46,6 +46,16 @@ try:
         expect(page.get_by_role('combobox',name='时间范围')).to_contain_text('今日')
         assert any(p=='/api/stats/hourly' for p,q in seen)
         page.get_by_role('combobox',name='时间范围').click()
+        page.get_by_role('option',name='昨日',exact=True).click()
+        yesterday = page.evaluate("(() => {const d=new Date();d.setDate(d.getDate()-1);return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;})()")
+        page.wait_for_timeout(500)
+        assert any(p=='/api/stats/hourly' and q.get('day')==[yesterday] for p,q in seen)
+        for endpoint in ('daily','by-model','by-key','by-account','by-account-model'):
+            assert any(p=='/api/stats/'+endpoint and q.get('start')==[yesterday] and q.get('end')==[yesterday] for p,q in seen),endpoint
+        expect(page.locator('.recharts-xAxis')).to_contain_text('00:00')
+        page.wait_for_function("[...document.querySelectorAll('.recharts-bar-rectangle path')].some(p => p.getBBox().height >= 220)")
+        page.screenshot(path=str(shots/'yesterday-desktop.png'),full_page=True)
+        page.get_by_role('combobox',name='时间范围').click()
         page.get_by_role('option',name='自定义',exact=True).click()
         page.get_by_label('开始日期',exact=True).fill('2020-10-01')
         page.get_by_label('结束日期',exact=True).fill('2020-10-03')
@@ -67,6 +77,7 @@ try:
         page.wait_for_function("[...document.querySelectorAll('.recharts-bar-rectangle path')].some(p => p.getBBox().height >= 220)")
         page.screenshot(path=str(shots/'custom-singleday-desktop.png'),full_page=True)
         page.set_viewport_size({'width':390,'height':900})
+        page.wait_for_timeout(1200)  # Let Recharts finish responsive resize/animation before capture.
         assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'), 'mobile horizontal overflow'
         page.wait_for_function("[...document.querySelectorAll('.recharts-bar-rectangle path')].some(p => p.getBBox().height >= 220)")
         page.screenshot(path=str(shots/'custom-range-mobile.png'),full_page=True)
@@ -75,6 +86,6 @@ try:
         expect(page.get_by_label('开始日期',exact=True)).to_have_count(0)
         assert not errors,errors
         browser.close()
-    print('PASS: default today, historical multi-day axis and five query ranges, account tables, historical hourly fetch, mobile layout, return to today; mocked APIs')
+    print('PASS: default today, yesterday hourly/date queries, historical multi-day axis and five query ranges, account tables, historical hourly fetch, mobile layout, return to today; mocked APIs')
 finally:
     server.shutdown();server.server_close()
