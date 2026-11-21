@@ -87,6 +87,12 @@ try:
         errors = []
         page.on('pageerror', lambda err: errors.append(str(err)))
         page.goto(base + '/login/')
+        page.evaluate('document.fonts.ready')
+        font_resources = page.evaluate("performance.getEntriesByType('resource').filter(r => /\\.woff2(?:$|\\?)/.test(r.name)).map(r => r.name)")
+        assert font_resources, 'local font assets must be requested by the rendered page'
+        assert all(urlparse(url).netloc == urlparse(base).netloc for url in font_resources)
+        assert page.evaluate("[...document.fonts].some(f => f.status === 'loaded')")
+        page.screenshot(path=str(shots / 'login-local-fonts-desktop.png'), full_page=True)
         button = page.get_by_role('button', name='登录', exact=True)
         expect(button).to_be_enabled()
         page.wait_for_function("getComputedStyle(document.querySelector('form').parentElement).opacity === '1'")
